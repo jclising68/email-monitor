@@ -9,6 +9,12 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+_PHT = ZoneInfo("Asia/Manila")
+
+def _now_pht() -> str:
+    return datetime.now(_PHT).strftime("%m/%d/%Y %I:%M %p PHT")
 from typing import Dict, List, Optional
 
 import requests
@@ -52,7 +58,7 @@ class SlackReporter:
     def send_zapmail_alert(self, email: str, workspace_name: str,
                            reconnect_attempted: bool = False) -> bool:
         """Send the one-time ZapMail disconnection alert."""
-        detected = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        detected = _now_pht()
         if reconnect_attempted:
             action = ":warning: Auto-reconnect via ZapMail API failed. Log in to Instantly and reconnect manually."
         else:
@@ -77,7 +83,7 @@ class SlackReporter:
             f"*Account:* {email}\n"
             f"*Workspace:* {workspace_name}\n"
             f"*Provider:* {provider.title()}\n"
-            f"*Time:* {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            f"*Time:* {_now_pht()}"
         )
         return self._send(text)
 
@@ -88,7 +94,7 @@ class SlackReporter:
             f"*Account:* {email}\n"
             f"*Workspace:* {workspace_name}\n"
             f"*Provider:* {provider.title()}\n"
-            f"*Time:* {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            f"*Time:* {_now_pht()}"
         )
         return self._send(text)
 
@@ -104,7 +110,7 @@ class SlackReporter:
             f"*Account:* {email}\n"
             f"*Workspace:* {workspace_name}\n"
             f"*Provider:* {provider.title()}\n"
-            f"*Time:* {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"*Time:* {_now_pht()}\n"
             f"{note}"
         )
         return self._send(text)
@@ -132,7 +138,7 @@ class WorkspaceSummary:
 
 class ReportData:
     def __init__(self):
-        self.generated_at: str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        self.generated_at: str = _now_pht()
         self.workspace_summaries: List[WorkspaceSummary] = []
 
         # Successful auto-reconnects this run
