@@ -1,0 +1,37 @@
+# Instantly Email Monitor — crontab entries
+#
+# Install on your server:
+#   crontab -e
+#   Paste the lines below (adjust the path to your project directory).
+#
+# To view current crontab:  crontab -l
+# To edit:                  crontab -e
+#
+# IMPORTANT: Use absolute paths everywhere — cron runs with a minimal $PATH.
+# Replace /home/user/email-monitor with the actual path to this project.
+# Replace /usr/bin/python3 with the output of: which python3
+
+# Load .env automatically (cron does not source shell profiles)
+BASH_ENV=/home/user/email-monitor/.env
+SHELL=/bin/bash
+
+# Hourly check + auto-reconnect (runs at minute 0 of every hour)
+0 * * * *   cd /home/user/email-monitor && /usr/bin/python3 monitor.py >> /var/log/email-monitor.log 2>&1
+
+# Daily Slack report at 9:00 AM UTC (runs check first, then posts report)
+0 9 * * *   cd /home/user/email-monitor && /usr/bin/python3 monitor.py --report >> /var/log/email-monitor.log 2>&1
+
+# ── Railway.app deployment (alternative to cron) ─────────────────────────────
+#
+# Create TWO Railway cron services from the same repo / Docker image:
+#
+# Service 1 — "email-monitor-hourly"
+#   Start command : python monitor.py
+#   Cron schedule : 0 * * * *
+#
+# Service 2 — "email-monitor-daily"
+#   Start command : python monitor.py --report
+#   Cron schedule : 0 9 * * *
+#
+# Set all env vars (SLACK_WEBHOOK_URL, GOOGLE_SHEETS_ID, etc.) in the
+# Railway dashboard under each service's Variables tab.

@@ -1,0 +1,49 @@
+name: Email Monitor
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # Every hour — check + auto-reconnect
+    - cron: '0 4 * * *'   # 4 AM UTC = 12 PM Philippines (UTC+8) — daily report
+  workflow_dispatch:       # Allow manual runs from GitHub UI
+    inputs:
+      report:
+        description: 'Send daily Slack report?'
+        required: false
+        default: 'false'
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          SLACK_WEBHOOK_URL:        ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_SHEETS_ID:         ${{ secrets.GOOGLE_SHEETS_ID }}
+          GOOGLE_TOKEN_JSON_B64:    ${{ secrets.GOOGLE_TOKEN_JSON_B64 }}
+          ZAPMAIL_API_KEY:          ${{ secrets.ZAPMAIL_API_KEY }}
+          MAX_RECONNECT_ATTEMPTS:   '5'
+          ZAPMAIL_REALERT_HOURS:    '0'
+          LOG_LEVEL:                'INFO'
+        run: |
+          # Daily report: fires at 4 AM UTC or when manually requested
+          if [ "${{ github.event.schedule }}" = "0 4 * * *" ] || [ "${{ github.event.inputs.report }}" = "true" ]; then
+            echo "Running daily report..."
+            python monitor.py --report
+          else
+            echo "Running hourly check..."
+            python monitor.py
+          fi

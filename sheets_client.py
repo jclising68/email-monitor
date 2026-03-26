@@ -1,0 +1,293 @@
+"""
+sheets_client.py — Read workspaces/accounts/alert_state from Google Sheets;
+                   write back alert_state rows.
+
+Tab names (case-sensitive):
+  workspaces  : workspace_name | api_key | active
+                [extras ignored: any extra columns]
+  accounts    : Email | First Name | Last Name |
+                IMAP Username | IMAP Password | IMAP Host | IMAP Port |
+                SMTP Username | SMTP Password | SMTP Host | SMTP Port |
+                [extras ignored: Daily Limit, Warmup Enabled, etc.]
+  alert_state : email | workspace_name | first_detected | last_alerted |
+                reconnect_attempts | status   ← managed automatically
+
+ZapMail mailboxes are discovered live from the ZapMail API — no sheet tab needed.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
+
+import gspread
+from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import json
+import os
+
+logger = logging.getLogger(__name__)
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+_CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "credentials.json")
+_TOKEN_FILE       = os.path.join(os.path.dirname(__file__), "token.json")
+
+
+def _get_oauth_credentials() -> OAuthCredentials:
+    """
+    Load or refresh OAuth2 credentials.
+
+    Two modes:
+      - Server/CI (GitHub Actions): reads token JSON from GOOGLE_TOKEN_JSON_B64 env var.
+        Uses the refresh_token to get new access tokens — no browser needed.
+      - Local: reads/writes token.json file; opens browser on first run.
+    """
+    import base64
+
+    token_b64 = os.environ.get("GOOGLE_TOKEN_JSON_B64")
+    if token_b64:
+        try:
+            token_data = json.loads(base64.b64decode(token_b64).decode("utf-8"))
+        except Exception as e:
+            raise EnvironmentError(f"Failed to decode GOOGLE_TOKEN_JSON_B64: {e}")
+        creds = OAuthCredentials.from_authorized_user_info(token_data, SCOPES)
+        if not creds.valid and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return creds
+
+    # Local file-based OAuth2 (opens browser for consent if no token.json)
+    creds = None
+    if os.path.exists(_TOKEN_FILE):
+        creds = OAuthCredentials.from_authorized_user_file(_TOKEN_FILE, SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(_CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(_TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+    return creds
+
+TAB_WORKSPACES  = "Workspaces"
+TAB_ACCOUNTS    = "Accounts"
+TAB_ALERT_STATE = "alert_state"   # created automatically on first run (lowercase is fine)
+
+_AS_COLS = ["email", "workspace_name", "first_detected", "last_alerted", "reconnect_attempts", "status"]
+
+# Hosts that identify Mission Inbox accounts (auto-reconnectable via SMTP/IMAP)
+MISSIONINBOX_IMAP_DOMAINS: Set[str] = {"outboxment.com", "inboxment.com"}
+
+# Map actual sheet column names → normalized internal field names
+_ACCOUNT_COLUMN_MAP: Dict[str, str] = {
+    "email":         "email",           # handle both title-case and lower variants
+    "Email":         "email",
+    "First Name":    "first_name",
+    "Last Name":     "last_name",
+    "IMAP Username": "imap_user",
+    "IMAP Password": "imap_password",
+    "IMAP Host":     "imap_host",
+    "IMAP Port":     "imap_port",
+    "SMTP Username": "smtp_user",
+    "SMTP Password": "smtp_password",
+    "SMTP Host":     "smtp_host",
+    "SMTP Port":     "smtp_port",
+}
+
+
+def _detect_provider(imap_host: str) -> str:
+    """Infer provider from IMAP hostname. Returns 'missioninbox' or 'unknown'."""
+    host = (imap_host or "").lower()
+    for domain in MISSIONINBOX_IMAP_DOMAINS:
+        if domain in host:
+            return "missioninbox"
+    return "unknown"
+
+
+def _normalise_account_row(raw: Dict) -> Dict:
+    """
+    Convert a raw gspread row (using actual sheet column names) to the
+    normalised field names used throughout the rest of the codebase.
+    Provider is auto-detected from IMAP Host.
+    """
+    out: Dict = {}
+    for sheet_col, internal_key in _ACCOUNT_COLUMN_MAP.items():
+        if sheet_col in raw:
+            out[internal_key] = raw[sheet_col]
+
+    # Ensure email is lowercase
+    out["email"] = str(out.get("email", "")).strip().lower()
+
+    # Auto-detect provider
+    out["provider"] = _detect_provider(str(out.get("imap_host", "")))
+
+    # Coerce ports to int
+    for port_field in ("imap_port", "smtp_port"):
+        try:
+            out[port_field] = int(out.get(port_field) or 0) or None
+        except (ValueError, TypeError):
+            out[port_field] = None
+
+    return out
+
+
+class SheetsClient:
+    def __init__(self, credentials_dict: dict, sheet_id: str):
+        """
+        credentials_dict is accepted for API compatibility but ignored —
+        authentication uses OAuth2 via credentials.json / token.json.
+        """
+        self._sheet_id = sheet_id
+        creds = _get_oauth_credentials()
+        self._gc = gspread.authorize(creds)
+        self._spreadsheet = None  # lazy open
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _open(self) -> gspread.Spreadsheet:
+        if self._spreadsheet is None:
+            self._spreadsheet = self._gc.open_by_key(self._sheet_id)
+        return self._spreadsheet
+
+    def _worksheet(self, tab: str) -> gspread.Worksheet:
+        return self._open().worksheet(tab)
+
+    # ── Public read methods ───────────────────────────────────────────────────
+
+    def get_workspaces(self) -> List[Dict]:
+        """
+        Return list of active workspace dicts.
+        Required columns : workspace_name, api_key, active
+        Optional columns : zapmail_workspace_key, zapmail_service_provider
+        """
+        ws = self._worksheet(TAB_WORKSPACES)
+        rows = ws.get_all_records()  # no expected_headers — extra cols are optional
+        result = []
+        for row in rows:
+            active = str(row.get("active", "")).strip().upper()
+            if active not in ("TRUE", "1", "YES"):
+                continue
+            ws_name = str(row.get("workspace_name", "")).strip()
+            api_key = str(row.get("api_key", "")).strip()
+            if not ws_name or not api_key:
+                logger.warning("Skipping workspace row with missing name or api_key: %s", row)
+                continue
+            result.append({
+                "workspace_name":          ws_name,
+                "api_key":                 api_key,
+                # Optional ZapMail columns — empty string if not present
+                "zapmail_workspace_key":   str(row.get("zapmail_workspace_key", "")).strip(),
+                "zapmail_service_provider": str(row.get("zapmail_service_provider", "GOOGLE")).strip().upper() or "GOOGLE",
+            })
+        logger.debug("Loaded %d active workspace(s) from Sheets.", len(result))
+        return result
+
+    def get_accounts(self) -> List[Dict]:
+        """
+        Return Mission Inbox accounts from the 'accounts' tab, normalised to
+        internal field names. Provider is auto-detected from IMAP Host.
+        """
+        ws = self._worksheet(TAB_ACCOUNTS)
+        raw_rows = ws.get_all_records()  # uses first row as headers automatically
+        result = []
+        for raw in raw_rows:
+            norm = _normalise_account_row(raw)
+            if norm.get("email"):
+                result.append(norm)
+        logger.debug("Loaded %d account credential row(s) from Sheets.", len(result))
+        return result
+
+    def get_alert_state(self) -> Dict[str, Dict]:
+        """
+        Return current alert_state as a dict keyed by email (lowercase).
+        Creates the header row automatically if the sheet is empty.
+        """
+        ws = self._worksheet(TAB_ALERT_STATE)
+        if not ws.row_values(1):
+            ws.append_row(_AS_COLS)
+            return {}
+        rows = ws.get_all_records(expected_headers=_AS_COLS)
+        state = {}
+        for row in rows:
+            email = str(row.get("email", "")).strip().lower()
+            if email:
+                state[email] = {k: row.get(k, "") for k in _AS_COLS}
+                try:
+                    state[email]["reconnect_attempts"] = int(state[email]["reconnect_attempts"] or 0)
+                except ValueError:
+                    state[email]["reconnect_attempts"] = 0
+        logger.debug("Loaded %d alert_state row(s) from Sheets.", len(state))
+        return state
+
+    # ── Public write methods ──────────────────────────────────────────────────
+
+    def _get_alert_state_worksheet_with_index(self) -> tuple[gspread.Worksheet, Dict[str, int]]:
+        """Return (worksheet, {email: row_number}) — row 1 is header."""
+        ws = self._worksheet(TAB_ALERT_STATE)
+        if not ws.row_values(1):
+            ws.append_row(_AS_COLS)
+        all_emails = ws.col_values(1)[1:]  # skip header
+        index = {e.strip().lower(): i + 2 for i, e in enumerate(all_emails) if e.strip()}
+        return ws, index
+
+    def upsert_alert_state(self, email: str, workspace_name: str,
+                           first_detected: str, last_alerted: str,
+                           reconnect_attempts: int, status: str) -> None:
+        """Insert or update a row in alert_state for the given email."""
+        ws, index = self._get_alert_state_worksheet_with_index()
+        row_data = [
+            email.lower(), workspace_name, first_detected, last_alerted,
+            reconnect_attempts, status,
+        ]
+        key = email.lower()
+        if key in index:
+            row_num = index[key]
+            ws.update(f"A{row_num}:F{row_num}", [row_data])
+            logger.debug("Updated alert_state row %d for %s", row_num, email)
+        else:
+            ws.append_row(row_data)
+            logger.debug("Appended alert_state row for %s", email)
+
+    def delete_alert_state(self, email: str) -> None:
+        """Remove a row from alert_state (account came back online)."""
+        ws, index = self._get_alert_state_worksheet_with_index()
+        key = email.lower()
+        if key not in index:
+            return
+        row_num = index[key]
+        ws.delete_rows(row_num)
+        logger.debug("Deleted alert_state row %d for %s (account recovered)", row_num, email)
+
+    def increment_reconnect_attempts(self, email: str, workspace_name: str,
+                                     status: str = "reconnect_failed") -> int:
+        """Increment reconnect_attempts for an existing row. Returns new count."""
+        ws, index = self._get_alert_state_worksheet_with_index()
+        key = email.lower()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        if key in index:
+            row_num = index[key]
+            row = ws.row_values(row_num)
+            while len(row) < 6:
+                row.append("")
+            try:
+                attempts = int(row[4] or 0) + 1
+            except ValueError:
+                attempts = 1
+            first_detected = row[2] or now
+            ws.update(f"A{row_num}:F{row_num}", [[
+                key, workspace_name, first_detected, now, attempts, status
+            ]])
+        else:
+            attempts = 1
+            ws.append_row([key, workspace_name, now, now, attempts, status])
+
+        logger.debug("reconnect_attempts for %s is now %d", email, attempts)
+        return attempts

@@ -1,0 +1,15 @@
+# Secrets — NEVER commit these
+.env
+credentials.json
+token.json
+service_account.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
