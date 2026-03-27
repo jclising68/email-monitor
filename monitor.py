@@ -179,11 +179,17 @@ def run(send_report: bool = False) -> None:
                         email, ws_name, client, sheets, slack, creds_by_email,
                         alert_state, report, _cfg,
                     )
-                else:
-                    # ZapMail (or unknown — treat same way, attempt reconnect if client available)
+                elif provider == "zapmail":
                     _handle_zapmail_disconnect(
                         email, ws_name, zapmail_client, sheets, slack,
                         alert_state, report, _cfg,
+                    )
+                else:
+                    # Unknown provider — client-owned account we don't manage.
+                    # Count it as disconnected in the report but do NOT alert or reconnect.
+                    logger.debug(
+                        "Account %s (%s) is disconnected but not a managed account — skipping.",
+                        email, ws_name,
                     )
 
         report.workspace_summaries.append(summary)
@@ -219,8 +225,8 @@ def _resolve_provider(
         return creds_by_email[email].get("provider", "missioninbox")
     if email in zapmail_email_set:
         return "zapmail"
-    api_provider = str(account.get("provider", account.get("email_provider", ""))).lower()
-    return api_provider if api_provider else "zapmail"
+    # Not in Mission Inbox credentials or ZapMail — client-owned account, skip silently
+    return "unknown"
 
 
 def _handle_missioninbox_disconnect(
