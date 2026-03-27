@@ -255,6 +255,13 @@ class InstantlyClient:
         return status in ("2", "paused")
 
     @staticmethod
+    def is_warming_up(account: Dict) -> bool:
+        """True if the account is in warmup mode (warmup_status == 1).
+        Warming-up accounts are connected but intentionally sending at reduced volume."""
+        warmup_status = account.get("warmup_status")
+        return str(warmup_status) == "1"
+
+    @staticmethod
     def parse_dns_failures(vitals: Dict) -> List[str]:
         """Return list of DNS record names that failed (e.g. ['DKIM', 'DMARC'])."""
         failures = []

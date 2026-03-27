@@ -141,13 +141,13 @@ def run(send_report: bool = False) -> None:
 
             connected = client.is_connected(account)
             paused    = not connected and client.is_paused(account)
+            in_warmup = connected and client.is_warming_up(account)
 
             if connected:
-                summary.connected += 1
-            elif paused:
-                summary.paused += 1
-                # Intentionally paused by user — skip silently, no reconnect, no alert
-                continue
+                if in_warmup:
+                    summary.warmup += 1
+                else:
+                    summary.connected += 1
 
                 # Clear stale alert_state if account recovered
                 if email in alert_state:
@@ -176,6 +176,10 @@ def run(send_report: bool = False) -> None:
                                 logger.info("DNS issues for %s: %s", domain, failures)
                     except Exception as exc:
                         logger.warning("DNS check failed for %s: %s (non-fatal)", domain, exc)
+
+            elif paused:
+                summary.paused += 1
+                # Intentionally paused — skip silently, no reconnect, no alert
 
             else:
                 summary.disconnected += 1
@@ -220,8 +224,8 @@ def run(send_report: bool = False) -> None:
 
         report.workspace_summaries.append(summary)
         logger.info(
-            "Workspace %s: %d connected, %d paused, %d disconnected, %d DNS issues.",
-            ws_name, summary.connected, summary.paused, summary.disconnected, summary.dns_issues,
+            "Workspace %s: %d connected, %d warmup, %d paused, %d disconnected, %d DNS issues.",
+            ws_name, summary.connected, summary.warmup, summary.paused, summary.disconnected, summary.dns_issues,
         )
 
     # ── Send batched client disconnection alert (one message for all) ─────────

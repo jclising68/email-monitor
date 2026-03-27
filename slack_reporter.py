@@ -153,6 +153,7 @@ class WorkspaceSummary:
     def __init__(self, name: str):
         self.name = name
         self.connected: int = 0
+        self.warmup: int = 0
         self.paused: int = 0
         self.disconnected: int = 0
         self.dns_issues: int = 0
@@ -208,6 +209,8 @@ def _format_daily_report(r: ReportData) -> str:
         for w in sorted(r.workspace_summaries, key=lambda x: x.name):
             pad = max_name_len - len(w.name)
             parts = [f"{w.connected} connected"]
+            if w.warmup:
+                parts.append(f"{w.warmup} warmup")
             if w.paused:
                 parts.append(f"{w.paused} paused")
             parts.append(f"{w.disconnected} disconnected")
