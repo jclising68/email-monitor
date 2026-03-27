@@ -10,6 +10,7 @@ Handles:
 from __future__ import annotations
 
 import logging
+import string
 import time
 from typing import Dict, Iterator, List, Optional
 
@@ -140,14 +141,25 @@ class InstantlyClient:
             starting_after = cursor
 
         # ── Phase 2: alphabet sweep — discover domains cursor pagination missed ─
-        import string
+        # Paginate each letter so workspaces with >100 accounts per letter are fully covered.
         for letter in string.ascii_lowercase:
-            data = self._request("GET", "/accounts", params={"limit": _PAGE_LIMIT, "search": letter})
-            items = data.get("items") or data.get("accounts") or []
-            for item in items:
-                email = str(item.get("email", "")).strip().lower()
-                if email and "@" in email:
-                    domains.add(email.split("@")[-1])
+            ltr_after: Optional[str] = None
+            ltr_cursors: set = set()
+            while True:
+                params = {"limit": _PAGE_LIMIT, "search": letter}
+                if ltr_after:
+                    params["starting_after"] = ltr_after
+                data = self._request("GET", "/accounts", params=params)
+                items = data.get("items") or data.get("accounts") or []
+                for item in items:
+                    email = str(item.get("email", "")).strip().lower()
+                    if email and "@" in email:
+                        domains.add(email.split("@")[-1])
+                ltr_cursor = data.get("next_starting_after") or data.get("next_cursor") or data.get("nextCursor")
+                if not items or not ltr_cursor or ltr_cursor in ltr_cursors:
+                    break
+                ltr_cursors.add(ltr_cursor)
+                ltr_after = ltr_cursor
 
         # ── Phase 3: per-domain search for ALL discovered domains ─────────────
         for domain in sorted(domains):

@@ -426,7 +426,19 @@ def main() -> None:
         help="Run checks then send the daily Slack summary report",
     )
     args = parser.parse_args()
-    run(send_report=args.report)
+    try:
+        run(send_report=args.report)
+    except Exception as exc:
+        logger.critical("Unhandled exception — monitor crashed: %s", exc, exc_info=True)
+        try:
+            SlackReporter(_cfg.slack_webhook_url)._send(
+                f":fire: *Email Monitor CRASHED*\n"
+                f"Unhandled error: `{exc}`\n"
+                f"Check GitHub Actions logs for full traceback."
+            )
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":

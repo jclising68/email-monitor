@@ -59,11 +59,9 @@ def attempt_reconnect(
         return False, False
 
     # ── Step 1: Delete (idempotent) ───────────────────────────────────────────
-    deleted = False
     try:
-        deleted = client.delete_account(email)
-        # deleted=False means 404 (account already gone) — that's fine, continue to POST
-        deleted = True  # treat 404 as "not present" = deletion done
+        client.delete_account(email)
+        # Returns False on 404 (account already gone) — that's fine, continue to POST
     except InstantlyAPIError as exc:
         logger.error("DELETE failed for %s: %s — aborting reconnect.", email, exc)
         return False, False

@@ -287,29 +287,3 @@ class SheetsClient:
         ws.delete_rows(row_num)
         logger.debug("Deleted alert_state row %d for %s (account recovered)", row_num, email)
 
-    def increment_reconnect_attempts(self, email: str, workspace_name: str,
-                                     status: str = "reconnect_failed") -> int:
-        """Increment reconnect_attempts for an existing row. Returns new count."""
-        ws, index = self._get_alert_state_worksheet_with_index()
-        key = email.lower()
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-        if key in index:
-            row_num = index[key]
-            row = ws.row_values(row_num)
-            while len(row) < 6:
-                row.append("")
-            try:
-                attempts = int(row[4] or 0) + 1
-            except ValueError:
-                attempts = 1
-            first_detected = row[2] or now
-            ws.update(f"A{row_num}:F{row_num}", [[
-                key, workspace_name, first_detected, now, attempts, status
-            ]])
-        else:
-            attempts = 1
-            ws.append_row([key, workspace_name, now, now, attempts, status])
-
-        logger.debug("reconnect_attempts for %s is now %d", email, attempts)
-        return attempts

@@ -8,16 +8,17 @@ Two message types:
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
+
+import requests
 
 _PHT = ZoneInfo("Asia/Manila")
 
 def _now_pht() -> str:
     return datetime.now(_PHT).strftime("%m/%d/%Y %I:%M %p PHT")
-from typing import Dict, List, Optional
-
-import requests
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,6 @@ class SlackReporter:
         lines.append(f"*Detected:* {_now_pht()}")
         lines.append(f"*Note:* These accounts are not managed by us (not ZapMail or Mission Inbox). Please notify the client to reconnect them in Instantly.\n")
         # Group by workspace
-        from collections import defaultdict
         by_ws: dict = defaultdict(list)
         for a in accounts:
             by_ws[a["workspace_name"]].append(a["email"])
