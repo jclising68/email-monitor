@@ -186,11 +186,21 @@ def run(send_report: bool = False) -> None:
                     )
                 else:
                     # Unknown provider — client-owned account we don't manage.
-                    # Count it as disconnected in the report but do NOT alert or reconnect.
-                    logger.debug(
-                        "Account %s (%s) is disconnected but not a managed account — skipping.",
-                        email, ws_name,
-                    )
+                    # Send a one-time heads-up alert (never repeat until it recovers).
+                    if is_new_disconnection(email, alert_state):
+                        slack.send_client_account_disconnected(email, ws_name)
+                        new_row = build_new_alert_state_row(email, ws_name)
+                        new_row["status"] = "client_disconnected"
+                        try:
+                            sheets.upsert_alert_state(**new_row)
+                            alert_state[email] = new_row
+                        except Exception as exc:
+                            logger.error("Failed to write alert_state for client account %s: %s", email, exc)
+                    else:
+                        logger.debug(
+                            "Client account %s (%s) still disconnected — already alerted, silent.",
+                            email, ws_name,
+                        )
 
         report.workspace_summaries.append(summary)
         logger.info(
