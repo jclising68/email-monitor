@@ -2,8 +2,8 @@ name: Email Monitor
 
 on:
   schedule:
-    - cron: '0 * * * *'   # Every hour — check + auto-reconnect
-    - cron: '0 4 * * *'   # 4 AM UTC = 12 PM Philippines (UTC+8) — daily report
+    - cron: '0 0,2,4,6,8,10,12,14,16,18,20,22 * * *'   # Every 2 hours — check + auto-reconnect (closest to 90 min in cron)
+    - cron: '0 4 * * *'                                  # 4 AM UTC = 12 PM Philippines — daily report
   workflow_dispatch:       # Allow manual runs from GitHub UI
     inputs:
       report:

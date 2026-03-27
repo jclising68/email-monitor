@@ -153,6 +153,7 @@ class WorkspaceSummary:
     def __init__(self, name: str):
         self.name = name
         self.connected: int = 0
+        self.paused: int = 0
         self.disconnected: int = 0
         self.dns_issues: int = 0
 
@@ -206,10 +207,12 @@ def _format_daily_report(r: ReportData) -> str:
         max_name_len = max(len(w.name) for w in r.workspace_summaries)
         for w in sorted(r.workspace_summaries, key=lambda x: x.name):
             pad = max_name_len - len(w.name)
-            lines.append(
-                f"`{w.name}`{' ' * pad}   "
-                f"{w.connected} connected | {w.disconnected} disconnected | {w.dns_issues} DNS issues"
-            )
+            parts = [f"{w.connected} connected"]
+            if w.paused:
+                parts.append(f"{w.paused} paused")
+            parts.append(f"{w.disconnected} disconnected")
+            parts.append(f"{w.dns_issues} DNS issues")
+            lines.append(f"`{w.name}`{' ' * pad}   " + " | ".join(parts))
     else:
         lines.append("_No workspaces checked._")
 

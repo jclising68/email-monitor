@@ -244,8 +244,15 @@ class InstantlyClient:
     def is_connected(account: Dict) -> bool:
         """True if the account status indicates it is healthy / connected."""
         status = str(account.get("status", "")).lower()
-        # Instantly may use "connected", "active", or numeric 1
+        # Instantly status 1 = Active/Connected
         return status in ("connected", "active", "1", "ok")
+
+    @staticmethod
+    def is_paused(account: Dict) -> bool:
+        """True if the account is intentionally paused (status 2).
+        Paused accounts should NOT be reconnected or alerted — the user paused them on purpose."""
+        status = str(account.get("status", "")).lower()
+        return status in ("2", "paused")
 
     @staticmethod
     def parse_dns_failures(vitals: Dict) -> List[str]:

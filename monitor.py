@@ -140,9 +140,14 @@ def run(send_report: bool = False) -> None:
                 continue
 
             connected = client.is_connected(account)
+            paused    = not connected and client.is_paused(account)
 
             if connected:
                 summary.connected += 1
+            elif paused:
+                summary.paused += 1
+                # Intentionally paused by user — skip silently, no reconnect, no alert
+                continue
 
                 # Clear stale alert_state if account recovered
                 if email in alert_state:
@@ -215,8 +220,8 @@ def run(send_report: bool = False) -> None:
 
         report.workspace_summaries.append(summary)
         logger.info(
-            "Workspace %s: %d connected, %d disconnected, %d DNS issues.",
-            ws_name, summary.connected, summary.disconnected, summary.dns_issues,
+            "Workspace %s: %d connected, %d paused, %d disconnected, %d DNS issues.",
+            ws_name, summary.connected, summary.paused, summary.disconnected, summary.dns_issues,
         )
 
     # ── Send batched client disconnection alert (one message for all) ─────────
