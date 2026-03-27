@@ -76,17 +76,26 @@ class SlackReporter:
             logger.info("Slack ZapMail alert sent for %s (%s)", email, workspace_name)
         return success
 
-    def send_client_account_disconnected(self, email: str, workspace_name: str) -> bool:
-        """One-time heads-up for a disconnected account that is NOT managed by us."""
-        text = (
-            f":warning: *Account Disconnected — Client Action Required*\n"
-            f"*Account:* {email}\n"
-            f"*Workspace:* {workspace_name}\n"
-            f"*Note:* This account is not managed by us (not ZapMail or Mission Inbox). "
-            f"Please notify the client to reconnect it in Instantly.\n"
-            f"*Detected:* {_now_pht()}"
-        )
-        return self._send(text)
+    def send_client_accounts_disconnected(self, accounts: list) -> bool:
+        """
+        One-time batched heads-up for multiple client-owned disconnected accounts.
+        accounts: list of {"email": ..., "workspace_name": ...}
+        """
+        if not accounts:
+            return True
+        lines = [f":warning: *Account Disconnected — Client Action Required*"]
+        lines.append(f"*Detected:* {_now_pht()}")
+        lines.append(f"*Note:* These accounts are not managed by us (not ZapMail or Mission Inbox). Please notify the client to reconnect them in Instantly.\n")
+        # Group by workspace
+        from collections import defaultdict
+        by_ws: dict = defaultdict(list)
+        for a in accounts:
+            by_ws[a["workspace_name"]].append(a["email"])
+        for ws_name, emails in sorted(by_ws.items()):
+            lines.append(f"*Workspace: {ws_name}*")
+            for email in sorted(emails):
+                lines.append(f"  • {email}")
+        return self._send("\n".join(lines))
 
     def send_reconnect_attempting(self, email: str, workspace_name: str, provider: str) -> bool:
         """Alert: reconnect attempt starting."""

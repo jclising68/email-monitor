@@ -82,6 +82,8 @@ def run(send_report: bool = False) -> None:
             slack.send_daily_report(report)
         return
 
+    new_client_disconnections: List[Dict] = []  # batched for single Slack message
+
     # ── Per-workspace processing ──────────────────────────────────────────────
     for ws in workspaces:
         ws_name  = ws["workspace_name"]
@@ -186,9 +188,9 @@ def run(send_report: bool = False) -> None:
                     )
                 else:
                     # Unknown provider — client-owned account we don't manage.
-                    # Send a one-time heads-up alert (never repeat until it recovers).
+                    # Collect for a single batched Slack message (sent once per run).
                     if is_new_disconnection(email, alert_state):
-                        slack.send_client_account_disconnected(email, ws_name)
+                        new_client_disconnections.append({"email": email, "workspace_name": ws_name})
                         new_row = build_new_alert_state_row(email, ws_name)
                         new_row["status"] = "client_disconnected"
                         try:
@@ -207,6 +209,10 @@ def run(send_report: bool = False) -> None:
             "Workspace %s: %d connected, %d disconnected, %d DNS issues.",
             ws_name, summary.connected, summary.disconnected, summary.dns_issues,
         )
+
+    # ── Send batched client disconnection alert (one message for all) ─────────
+    if new_client_disconnections:
+        slack.send_client_accounts_disconnected(new_client_disconnections)
 
     # ── Daily report ──────────────────────────────────────────────────────────
     if send_report:

@@ -164,7 +164,18 @@ class SheetsClient:
                 if attempt > 0:
                     self._spreadsheet = None  # force re-open on retry
                     time.sleep(5 * attempt)
-                return self._open().worksheet(tab)
+                try:
+                    return self._open().worksheet(tab)
+                except gspread.exceptions.WorksheetNotFound:
+                    # Auto-create the alert_state tab if missing
+                    if tab == TAB_ALERT_STATE:
+                        logger.info("Creating missing '%s' tab in Google Sheet.", tab)
+                        ws = self._open().add_worksheet(title=tab, rows=1000, cols=len(_AS_COLS))
+                        ws.append_row(_AS_COLS)
+                        return ws
+                    raise
+            except gspread.exceptions.WorksheetNotFound:
+                raise
             except Exception as e:
                 last_exc = e
                 logger.warning("Google Sheets transient error (attempt %d/3): %s", attempt + 1, e)
