@@ -188,11 +188,20 @@ def run(send_report: bool = False) -> None:
                     )
                 else:
                     # Unknown provider — client-owned account we don't manage.
-                    # Collect for a single batched Slack message (sent once per run).
-                    if is_new_disconnection(email, alert_state):
+                    # Alert once, then re-alert every 24 hours if still disconnected.
+                    is_new   = is_new_disconnection(email, alert_state)
+                    re_alert = should_realert_zapmail(email, alert_state, realert_hours=24)
+                    if is_new or re_alert:
                         new_client_disconnections.append({"email": email, "workspace_name": ws_name})
-                        new_row = build_new_alert_state_row(email, ws_name)
-                        new_row["status"] = "client_disconnected"
+                        existing_row = alert_state.get(email, {})
+                        new_row = {
+                            "email": email.lower(),
+                            "workspace_name": ws_name,
+                            "first_detected": existing_row.get("first_detected") or utcnow_str(),
+                            "last_alerted": utcnow_str(),
+                            "reconnect_attempts": 0,
+                            "status": "client_disconnected",
+                        }
                         try:
                             sheets.upsert_alert_state(**new_row)
                             alert_state[email] = new_row
@@ -200,7 +209,7 @@ def run(send_report: bool = False) -> None:
                             logger.error("Failed to write alert_state for client account %s: %s", email, exc)
                     else:
                         logger.debug(
-                            "Client account %s (%s) still disconnected — already alerted, silent.",
+                            "Client account %s (%s) still disconnected — alerted within 24h, silent.",
                             email, ws_name,
                         )
 
