@@ -157,7 +157,18 @@ class SheetsClient:
         return self._spreadsheet
 
     def _worksheet(self, tab: str) -> gspread.Worksheet:
-        return self._open().worksheet(tab)
+        import time
+        last_exc = None
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    self._spreadsheet = None  # force re-open on retry
+                    time.sleep(5 * attempt)
+                return self._open().worksheet(tab)
+            except Exception as e:
+                last_exc = e
+                logger.warning("Google Sheets transient error (attempt %d/3): %s", attempt + 1, e)
+        raise last_exc
 
     # ── Public read methods ───────────────────────────────────────────────────
 
