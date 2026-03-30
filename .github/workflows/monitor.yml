@@ -2,9 +2,10 @@ name: Email Monitor
 
 on:
   schedule:
-    - cron: '0 0,2,4,6,8,10,12,14,16,18,20,22 * * *'   # Every 2 hours — check + auto-reconnect
-    - cron: '0 4 * * *'                                  # 4 AM UTC = 12 PM PHT — daily report
-    - cron: '0 4 * * 1'                                  # Monday 4 AM UTC = Monday 12 PM PHT — weekly domain report
+    # Every 2 hours at :00 EXCEPT 4 AM UTC (handled by the daily cron)
+    - cron: '0 0,2,6,8,10,12,14,16,18,20,22 * * *'
+    # 4 AM UTC = 12 PM PHT — daily report (+ weekly on Monday, detected in script)
+    - cron: '0 4 * * *'
   workflow_dispatch:       # Allow manual runs from GitHub UI
     inputs:
       report:
@@ -49,15 +50,26 @@ jobs:
           LOG_LEVEL:                'INFO'
         run: |
           SCHEDULE="${{ github.event.schedule }}"
+          DAY_OF_WEEK=$(date -u +%u)  # 1=Monday, 7=Sunday
 
-          # Weekly: Monday 4 AM UTC — sends daily + weekly domain report
-          if [ "${{ github.event.inputs.weekly_report }}" = "true" ] || [ "$SCHEDULE" = "0 4 * * 1" ]; then
-            echo "Running daily + weekly domain health report..."
+          # Manual: weekly report requested
+          if [ "${{ github.event.inputs.weekly_report }}" = "true" ]; then
+            echo "Running daily + weekly domain health report (manual)..."
             python monitor.py --report --weekly-report
-          # Daily report: 4 AM UTC (non-Monday) or manual
-          elif [ "${{ github.event.inputs.report }}" = "true" ] || [ "$SCHEDULE" = "0 4 * * *" ]; then
-            echo "Running daily report..."
+          # Manual: daily report requested
+          elif [ "${{ github.event.inputs.report }}" = "true" ]; then
+            echo "Running daily report (manual)..."
             python monitor.py --report
+          # Scheduled: 4 AM UTC = 12 PM PHT — daily report (+ weekly on Monday)
+          elif [ "$SCHEDULE" = "0 4 * * *" ]; then
+            if [ "$DAY_OF_WEEK" = "1" ]; then
+              echo "Running daily + weekly domain health report (Monday)..."
+              python monitor.py --report --weekly-report
+            else
+              echo "Running daily report..."
+              python monitor.py --report
+            fi
+          # Scheduled: every other 2-hour slot — hourly check only
           else
             echo "Running hourly check..."
             python monitor.py

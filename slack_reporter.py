@@ -411,9 +411,8 @@ def _format_weekly_domain_report(r: ReportData) -> str:
     # Sort by health score ascending (worst first)
     sorted_domains = sorted(r.domain_health, key=lambda d: d.get("avg_health", 100))
 
-    # Split into bad (< 85%) and healthy
+    # Domains needing attention (< 85% health)
     bad_domains = [d for d in sorted_domains if d.get("avg_health", 100) < 85]
-    healthy_domains = [d for d in sorted_domains if d.get("avg_health", 100) >= 85]
 
     if bad_domains:
         lines.append(":warning: *Domains Needing Attention*")
