@@ -45,17 +45,17 @@ jobs:
           HEALTH_SCORE_ALERT_THRESHOLD: '80'
           HEALTH_SCORE_CRITICAL_THRESHOLD: '60'
           SPAM_RATE_ALERT_THRESHOLD: '10'
+          BOUNCE_RATE_ALERT_THRESHOLD: '5'
           LOG_LEVEL:                'INFO'
         run: |
           SCHEDULE="${{ github.event.schedule }}"
-          DAY_OF_WEEK=$(date -u +%u)  # 1=Monday
 
-          # Weekly domain health report: Monday 4 AM UTC or manual
-          if [ "${{ github.event.inputs.weekly_report }}" = "true" ] || ([ "$SCHEDULE" = "0 4 * * 1" ]); then
-            echo "Running weekly domain health report..."
-            python monitor.py --weekly-report
+          # Weekly: Monday 4 AM UTC — sends daily + weekly domain report
+          if [ "${{ github.event.inputs.weekly_report }}" = "true" ] || [ "$SCHEDULE" = "0 4 * * 1" ]; then
+            echo "Running daily + weekly domain health report..."
+            python monitor.py --report --weekly-report
           # Daily report: 4 AM UTC (non-Monday) or manual
-          elif [ "${{ github.event.inputs.report }}" = "true" ] || ([ "$SCHEDULE" = "0 4 * * *" ] && [ "$DAY_OF_WEEK" != "1" ]); then
+          elif [ "${{ github.event.inputs.report }}" = "true" ] || [ "$SCHEDULE" = "0 4 * * *" ]; then
             echo "Running daily report..."
             python monitor.py --report
           else

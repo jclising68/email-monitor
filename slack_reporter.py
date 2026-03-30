@@ -237,6 +237,14 @@ class ReportData:
         # [{domain, workspace_name, avg_health, total_inbox, total_spam, spam_rate, account_count, dns_status}]
         self.domain_health: List[Dict] = []
 
+        # Tracking domain issues
+        # [{email, workspace_name, issue}]
+        self.tracking_domain_issues: List[Dict] = []
+
+        # Campaign bounce rate alerts
+        # [{campaign_name, workspace_name, bounce_rate, bounced, sent}]
+        self.bounce_alerts: List[Dict] = []
+
     @property
     def total_workspaces(self) -> int:
         return len(self.workspace_summaries)
@@ -355,6 +363,24 @@ def _format_daily_report(r: ReportData) -> str:
     else:
         lines.append(":thermometer: *Warmup Health*")
         lines.append("_All accounts healthy._")
+
+    # ── Tracking domain issues ──
+    if r.tracking_domain_issues:
+        lines.append("")
+        lines.append(":link: *Tracking Domain Issues*")
+        for item in r.tracking_domain_issues:
+            lines.append(f"• {item['email']} ({item['workspace_name']}) — {item['issue']}")
+
+    # ── Bounce rate alerts ──
+    if r.bounce_alerts:
+        lines.append("")
+        lines.append(":boom: *Campaign Bounce Alerts*")
+        for item in sorted(r.bounce_alerts, key=lambda x: x.get("bounce_rate", 0), reverse=True):
+            lines.append(
+                f"• {item['campaign_name']} ({item['workspace_name']}) — "
+                f"Bounce rate: {item['bounce_rate']:.1f}% "
+                f"({item['bounced']}/{item['sent']} emails)"
+            )
 
     # ── DNS issues ──
     lines.append("")

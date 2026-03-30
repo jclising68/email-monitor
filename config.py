@@ -86,6 +86,11 @@ class Config:
             get_env("SPAM_RATE_ALERT_THRESHOLD", required=False, default="10")
         )
 
+        # Campaign bounce rate threshold (percentage). Alert if bounced/sent exceeds this.
+        self.bounce_rate_alert_threshold: int = int(
+            get_env("BOUNCE_RATE_ALERT_THRESHOLD", required=False, default="5")
+        )
+
     def configure_logging(self):
         logging.basicConfig(
             level=getattr(logging, self.log_level, logging.INFO),

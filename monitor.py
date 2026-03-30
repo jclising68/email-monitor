@@ -237,30 +237,53 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                             email, ws_name,
                         )
 
-        # ── Warmup health analytics ──────────────────────────────────────────
-        # Collect all emails for health check (connected + warmup accounts only)
-        all_emails = [
+        # ── Tracking domain status check (data already in accounts) ────────
+        for account in accounts:
+            email_td = str(account.get("email", "")).strip().lower()
+            if not email_td or not client.is_connected(account):
+                continue
+            try:
+                td_issue = client.has_tracking_domain_issue(account)
+                if td_issue:
+                    report.tracking_domain_issues.append({
+                        "email": email_td, "workspace_name": ws_name,
+                        "issue": td_issue,
+                    })
+            except Exception:
+                pass  # non-fatal — tracking domain check is best-effort
+
+        # ── Warmup health analytics (separate from reconnect flow) ────────
+        all_connected_emails = [
             str(a.get("email", "")).strip().lower()
             for a in accounts
             if client.is_connected(a) and str(a.get("email", "")).strip()
         ]
 
-        if all_emails:
+        if all_connected_emails:
             end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             start_date = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
             try:
-                warmup_agg = client.get_warmup_analytics(all_emails, start_date, end_date)
+                warmup_agg = client.get_warmup_analytics(all_connected_emails, start_date, end_date)
                 _process_warmup_health(
-                    warmup_agg, ws_name, accounts, slack, report, _cfg,
-                    send_weekly_report=send_weekly_report,
+                    warmup_agg, ws_name, slack, report, _cfg,
                     dns_failures_by_domain={
                         f["domain"]: f["missing"]
                         for f in report.dns_failures
                         if f.get("workspace_name") == ws_name
                     },
+                    is_report_run=(send_report or send_weekly_report),
                 )
             except Exception as exc:
                 logger.warning("Warmup analytics failed for %s: %s (non-fatal)", ws_name, exc)
+
+        # ── Campaign bounce rate check ────────────────────────────────────
+        try:
+            end_date_c = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            start_date_c = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+            campaigns = client.get_campaign_analytics(start_date_c, end_date_c)
+            _process_campaign_health(campaigns, ws_name, slack, report, _cfg)
+        except Exception as exc:
+            logger.warning("Campaign analytics failed for %s: %s (non-fatal)", ws_name, exc)
 
         report.workspace_summaries.append(summary)
         logger.info(
@@ -339,23 +362,28 @@ def _resolve_provider(
 def _process_warmup_health(
     warmup_agg: Dict,
     ws_name: str,
-    accounts: List[Dict],
     slack: "SlackReporter",
     report: ReportData,
     cfg: "Config",
-    send_weekly_report: bool = False,
     dns_failures_by_domain: Optional[Dict[str, List[str]]] = None,
+    is_report_run: bool = False,
 ) -> None:
     """
     Process warmup analytics aggregate data for one workspace.
 
-    - Sends immediate Slack alerts for accounts below health thresholds
-    - Sends immediate Slack alerts for high spam rates
-    - Aggregates domain-level health for weekly report
+    Fully isolated from the reconnect flow — failures here never affect
+    account monitoring or auto-reconnect. Does NOT write to alert_state
+    or Sheets — purely read-only + Slack notifications.
+
+    Alert frequency strategy:
+      - CRITICAL health (< 60%): alerts every 2-hour check (urgent)
+      - WARNING health (60-80%): alerts only during daily/weekly reports
+      - High spam rate (> 10%): alerts only during daily/weekly reports
+    This prevents Slack flooding while ensuring critical issues are visible.
     """
     dns_failures_by_domain = dns_failures_by_domain or {}
 
-    # Per-domain aggregation for weekly report
+    # Per-domain aggregation
     domain_data: Dict[str, Dict] = defaultdict(lambda: {
         "total_inbox": 0, "total_spam": 0,
         "health_scores": [], "account_count": 0,
@@ -367,7 +395,7 @@ def _process_warmup_health(
         landed_spam  = agg.get("landed_spam", 0)
         total = landed_inbox + landed_spam
 
-        # Calculate spam rate
+        # Calculate spam rate (guard against division by zero)
         spam_rate = (landed_spam / total * 100) if total > 0 else 0.0
 
         domain = email.split("@")[-1] if "@" in email else ""
@@ -381,30 +409,35 @@ def _process_warmup_health(
             if health_score is not None:
                 dd["health_scores"].append(health_score)
 
-        # ── Immediate health score alerts ─────────────────────────────────
+        # ── Health score alerts ───────────────────────────────────────────
         if health_score is not None and health_score < cfg.health_score_alert_threshold:
             is_critical = health_score < cfg.health_score_critical_threshold
-            logger.warning(
-                "Health %s for %s (%s): score=%d, spam_rate=%.1f%%",
-                "CRITICAL" if is_critical else "WARNING",
-                email, ws_name, health_score, spam_rate,
-            )
-            slack.send_health_alert(email, ws_name, health_score, spam_rate, is_critical)
+            # Critical: alert every run. Warning: alert only on report runs.
+            if is_critical or is_report_run:
+                logger.warning(
+                    "Health %s for %s (%s): score=%d, spam_rate=%.1f%%",
+                    "CRITICAL" if is_critical else "WARNING",
+                    email, ws_name, health_score, spam_rate,
+                )
+                slack.send_health_alert(email, ws_name, health_score, spam_rate, is_critical)
+            # Always add to report data for daily summary
             report.health_alerts.append({
                 "email": email, "workspace_name": ws_name,
                 "health_score": health_score, "spam_rate": spam_rate,
             })
 
-        # ── Immediate spam rate alerts ────────────────────────────────────
+        # ── Spam rate alerts (only if health is otherwise OK) ─────────────
         elif total > 0 and spam_rate >= cfg.spam_rate_alert_threshold:
-            logger.warning(
-                "High spam rate for %s (%s): %.1f%% (%d spam of %d total)",
-                email, ws_name, spam_rate, landed_spam, total,
-            )
-            slack.send_spam_rate_alert(email, ws_name, spam_rate, landed_spam, landed_inbox)
+            if is_report_run:
+                logger.warning(
+                    "High spam rate for %s (%s): %.1f%% (%d spam of %d total)",
+                    email, ws_name, spam_rate, landed_spam, total,
+                )
+                slack.send_spam_rate_alert(email, ws_name, spam_rate, landed_spam, landed_inbox)
             report.health_alerts.append({
                 "email": email, "workspace_name": ws_name,
-                "health_score": health_score or 0, "spam_rate": spam_rate,
+                "health_score": health_score if health_score is not None else 0,
+                "spam_rate": spam_rate,
             })
 
     # ── Build domain health entries (always, for daily + weekly reports) ───
@@ -427,6 +460,46 @@ def _process_warmup_health(
             "account_count": dd["account_count"],
             "dns_status": dns_status,
         })
+
+
+def _process_campaign_health(
+    campaigns: List[Dict],
+    ws_name: str,
+    slack: "SlackReporter",
+    report: ReportData,
+    cfg: "Config",
+) -> None:
+    """
+    Check campaign bounce rates. Fully isolated from reconnect flow.
+    Only checks active campaigns (status=1) with meaningful send volume.
+    """
+    for campaign in campaigns:
+        status = campaign.get("campaign_status")
+        if status != 1:  # only check active campaigns
+            continue
+
+        name = campaign.get("campaign_name", "Unknown")
+        sent = campaign.get("emails_sent_count", 0)
+        bounced = campaign.get("bounced_count", 0)
+
+        # Need meaningful volume — at least 50 emails sent to judge bounce rate
+        if sent < 50:
+            continue
+
+        bounce_rate = (bounced / sent * 100) if sent > 0 else 0.0
+
+        if bounce_rate >= cfg.bounce_rate_alert_threshold:
+            logger.warning(
+                "High bounce rate for campaign '%s' (%s): %.1f%% (%d/%d)",
+                name, ws_name, bounce_rate, bounced, sent,
+            )
+            report.bounce_alerts.append({
+                "campaign_name": name,
+                "workspace_name": ws_name,
+                "bounce_rate": bounce_rate,
+                "bounced": bounced,
+                "sent": sent,
+            })
 
 
 def _handle_missioninbox_disconnect(

@@ -277,6 +277,40 @@ class InstantlyClient:
 
         return all_aggregate
 
+    # ── Campaign analytics ─────────────────────────────────────────────────────
+
+    def get_campaign_analytics(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        GET /campaigns/analytics — performance metrics for all campaigns.
+
+        Returns list of campaign dicts with:
+          - campaign_name, campaign_id, campaign_status
+          - emails_sent_count, bounced_count, reply_count, open_count
+          - unsubscribed_count, link_click_count
+        """
+        params: Dict = {}
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        params["exclude_total_leads_count"] = True  # faster response
+
+        try:
+            result = self._request("GET", "/campaigns/analytics", params=params)
+            if isinstance(result, list):
+                return result
+            return result.get("items", result.get("campaigns", []))
+        except InstantlyAPIError as exc:
+            logger.warning("Campaign analytics failed: %s", exc)
+            return []
+        except Exception as exc:
+            logger.warning("Campaign analytics unexpected error: %s", exc)
+            return []
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -313,3 +347,17 @@ class InstantlyClient:
             if not valid:
                 failures.append(record.upper())
         return failures
+
+    @staticmethod
+    def has_tracking_domain_issue(account: Dict) -> Optional[str]:
+        """
+        Check if account has a tracking domain configured but it's not active.
+        Returns the issue description string, or None if healthy/no tracking domain.
+        """
+        td_name = str(account.get("tracking_domain_name") or "").strip()
+        if not td_name:
+            return None  # no tracking domain configured — not an issue
+        td_status = str(account.get("tracking_domain_status") or "").strip()
+        if td_status == "CTD_ACTIVE":
+            return None  # healthy
+        return f"tracking domain '{td_name}' status: {td_status or 'unknown'}"
