@@ -130,9 +130,8 @@ def run(send_report: bool = False) -> None:
             except Exception as exc:
                 logger.error(
                     "MissionInbox: failed to list mailboxes for workspace '%s' (%s) — "
-                    "Mission Inbox reconnect disabled for this workspace.", ws_name, exc,
+                    "MI email set empty but client kept for individual lookups.", ws_name, exc,
                 )
-                missioninbox_client = None
 
         try:
             accounts = client.get_all_accounts()
@@ -196,7 +195,7 @@ def run(send_report: bool = False) -> None:
 
             else:
                 summary.disconnected += 1
-                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set, account, missioninbox_client is not None)
+                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set, missioninbox_client)
 
                 if provider == "missioninbox":
                     _handle_missioninbox_disconnect(
@@ -255,15 +254,11 @@ def run(send_report: bool = False) -> None:
 
 # ── Disconnect handlers ───────────────────────────────────────────────────────
 
-_MI_HOST_MARKERS = ("outboxment.com", "inboxment.com")
-
-
 def _resolve_provider(
     email: str,
     missioninbox_email_set: set,
     zapmail_email_set: set,
-    account: Dict,
-    has_mi_client: bool,
+    missioninbox_client: Optional["MissionInboxClient"],
 ) -> str:
     """
     Determine provider for a disconnected account.
@@ -272,19 +267,36 @@ def _resolve_provider(
     are not affected.
 
     Priority:
-      1. If MI API key configured: check MI email list, then account SMTP/IMAP host
-      2. ZapMail live mailbox list
-      3. Unknown — client-owned account, do not reconnect
-    """
-    if has_mi_client:
-        if email in missioninbox_email_set:
-            return "missioninbox"
-        # Detect from the connection settings Instantly stores per account
-        for host_field in ("smtp_host", "imap_host"):
-            host = str(account.get(host_field) or "").lower()
-            if any(marker in host for marker in _MI_HOST_MARKERS):
-                return "missioninbox"
+      1. MI email set (from list_mailboxes) — always wins over ZapMail
+      2. If MI client exists but MI set is empty (API failure): single-email
+         MI API lookup to prevent misidentification as ZapMail
+      3. ZapMail live mailbox list
+      4. Unknown — client-owned account, do not reconnect
 
+    NOTE: Instantly's account list API does NOT return smtp_host/imap_host,
+    so host-based detection is not possible. We rely on the MI API instead.
+    """
+    # 1. MI email set — takes priority over ZapMail
+    if email in missioninbox_email_set:
+        return "missioninbox"
+
+    # 2. MI client exists but set is empty (list_mailboxes failed)?
+    #    Do a single-email lookup before falling through to ZapMail.
+    if missioninbox_client is not None and not missioninbox_email_set:
+        try:
+            creds = missioninbox_client.get_credentials(email)
+            if creds:
+                logger.info(
+                    "MI individual lookup confirmed %s is Mission Inbox.", email
+                )
+                return "missioninbox"
+        except Exception as exc:
+            logger.warning(
+                "MI individual lookup failed for %s: %s — falling through.",
+                email, exc,
+            )
+
+    # 3. ZapMail
     if email in zapmail_email_set:
         return "zapmail"
 
