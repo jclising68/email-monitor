@@ -60,7 +60,7 @@ class SlackReporter:
                                     provider: str, reconnect_attempted: bool = False) -> bool:
         """Send a one-time disconnection alert for any provider requiring manual action."""
         detected = _now_pht()
-        provider_label = provider.title()
+        provider_label = provider
         if reconnect_attempted:
             action = f":warning: Auto-reconnect via {provider_label} API failed. Log in to Instantly and reconnect manually."
         else:
@@ -109,7 +109,7 @@ class SlackReporter:
             f":arrows_counterclockwise: *Attempting to reconnect account*\n"
             f"*Account:* {email}\n"
             f"*Workspace:* {workspace_name}\n"
-            f"*Provider:* {provider.title()}\n"
+            f"*Provider:* {provider}\n"
             f"*Time:* {_now_pht()}"
         )
         return self._send(text)
@@ -120,7 +120,7 @@ class SlackReporter:
             f":white_check_mark: *Reconnected successfully*\n"
             f"*Account:* {email}\n"
             f"*Workspace:* {workspace_name}\n"
-            f"*Provider:* {provider.title()}\n"
+            f"*Provider:* {provider}\n"
             f"*Time:* {_now_pht()}"
         )
         return self._send(text)
@@ -136,7 +136,7 @@ class SlackReporter:
             f":x: *Reconnect failed*\n"
             f"*Account:* {email}\n"
             f"*Workspace:* {workspace_name}\n"
-            f"*Provider:* {provider.title()}\n"
+            f"*Provider:* {provider}\n"
             f"*Time:* {_now_pht()}\n"
             f"{note}"
         )
@@ -256,9 +256,11 @@ def _format_daily_report(r: ReportData) -> str:
     lines.append("")
     if r.reconnected:
         lines.append(":white_check_mark: *Auto-Reconnected*")
+        _PROVIDER_LABELS = {"zapmail": "ZapMail", "missioninbox": "Mission Inbox"}
         for item in r.reconnected:
             provider = item.get("provider", "")
-            provider_tag = f" _({provider.replace('missioninbox', 'Mission Inbox').title()})_" if provider else ""
+            label = _PROVIDER_LABELS.get(provider, provider.title())
+            provider_tag = f" _({label})_" if label else ""
             lines.append(f"• {item['email']} ({item['workspace_name']}){provider_tag}")
     else:
         lines.append(":white_check_mark: *Auto-Reconnected*")
