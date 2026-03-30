@@ -202,11 +202,13 @@ class SheetsClient:
                 logger.warning("Skipping workspace row with missing name or api_key: %s", row)
                 continue
             result.append({
-                "workspace_name":          ws_name,
-                "api_key":                 api_key,
+                "workspace_name":           ws_name,
+                "api_key":                  api_key,
                 # Optional ZapMail columns — empty string if not present
-                "zapmail_workspace_key":   str(row.get("zapmail_workspace_key", "")).strip(),
+                "zapmail_workspace_key":    str(row.get("zapmail_workspace_key", "")).strip(),
                 "zapmail_service_provider": str(row.get("zapmail_service_provider", "GOOGLE")).strip().upper() or "GOOGLE",
+                # Optional Mission Inbox API key — empty string if not present
+                "mission_inbox_api_key":    str(row.get("mission_inbox_api_key", "")).strip(),
             })
         logger.debug("Loaded %d active workspace(s) from Sheets.", len(result))
         return result

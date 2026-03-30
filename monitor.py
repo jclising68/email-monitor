@@ -22,6 +22,7 @@ except EnvironmentError as _env_err:
     sys.exit(1)
 
 from instantly_client import InstantlyClient, InstantlyAPIError
+from missioninbox_client import MissionInboxClient
 from reconnect import attempt_reconnect, attempt_post_only
 from sheets_client import SheetsClient
 from slack_reporter import SlackReporter, ReportData, WorkspaceSummary
@@ -53,25 +54,14 @@ def run(send_report: bool = False) -> None:
         sys.exit(1)
 
     try:
-        all_account_creds: List[Dict] = sheets.get_accounts()
-    except Exception as exc:
-        logger.critical("Cannot read 'accounts' sheet: %s", exc)
-        slack._send(f":fire: *Email Monitor CRITICAL:* Cannot read accounts sheet: {exc}")
-        sys.exit(1)
-
-    try:
         alert_state: Dict[str, Dict] = sheets.get_alert_state()
     except Exception as exc:
         logger.error("Cannot read 'alert_state' sheet: %s — proceeding without dedup.", exc)
         alert_state = {}
 
-    # Index Mission Inbox credentials by email for O(1) lookup
-    creds_by_email: Dict[str, Dict] = {
-        row["email"].lower(): row for row in all_account_creds if row.get("email")
-    }
-
     # ZapMail uses one global API key + a per-workspace ID (from the sheet).
-    # Clients and email sets are built inside the workspace loop below.
+    # Mission Inbox uses a per-workspace API key (from the sheet).
+    # Both clients are built inside the workspace loop below.
     zapmail_api_key = _cfg.zapmail_api_key
     if not zapmail_api_key:
         logger.debug("ZAPMAIL_API_KEY not set — ZapMail auto-reconnect disabled.")
@@ -120,6 +110,29 @@ def run(send_report: bool = False) -> None:
                     "ZapMail reconnect disabled for this workspace.", ws_name, exc,
                 )
                 zapmail_client = None
+
+        # Build a Mission Inbox client for this workspace if it has an API key configured
+        missioninbox_client: Optional[MissionInboxClient] = None
+        missioninbox_email_set: set = set()
+        mi_api_key = ws.get("mission_inbox_api_key", "")
+        if mi_api_key:
+            missioninbox_client = MissionInboxClient(api_key=mi_api_key)
+            try:
+                mi_mailboxes = missioninbox_client.list_mailboxes()
+                missioninbox_email_set = {
+                    str(mb.get("email", "")).lower()
+                    for mb in mi_mailboxes if mb.get("email")
+                }
+                logger.info(
+                    "MissionInbox: workspace '%s' has %d mailbox(es).",
+                    ws_name, len(missioninbox_email_set),
+                )
+            except Exception as exc:
+                logger.error(
+                    "MissionInbox: failed to list mailboxes for workspace '%s' (%s) — "
+                    "Mission Inbox reconnect disabled for this workspace.", ws_name, exc,
+                )
+                missioninbox_client = None
 
         try:
             accounts = client.get_all_accounts()
@@ -183,11 +196,11 @@ def run(send_report: bool = False) -> None:
 
             else:
                 summary.disconnected += 1
-                provider = _resolve_provider(email, creds_by_email, zapmail_email_set, account)
+                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set)
 
                 if provider == "missioninbox":
                     _handle_missioninbox_disconnect(
-                        email, ws_name, client, sheets, slack, creds_by_email,
+                        email, ws_name, client, sheets, slack, missioninbox_client,
                         alert_state, report, _cfg,
                     )
                 elif provider == "zapmail":
@@ -244,22 +257,20 @@ def run(send_report: bool = False) -> None:
 
 def _resolve_provider(
     email: str,
-    creds_by_email: Dict,
+    missioninbox_email_set: set,
     zapmail_email_set: set,
-    account: Dict,
 ) -> str:
     """
     Determine provider for a disconnected account.
     Priority:
-      1. If email is in Mission Inbox credentials sheet → missioninbox
+      1. If email is in Mission Inbox's live mailbox list → missioninbox
       2. If email is in ZapMail's live mailbox list → zapmail
-      3. Fall back to Instantly API field → zapmail as safe default
+      3. Otherwise → client-owned account, do not reconnect
     """
-    if email in creds_by_email:
-        return creds_by_email[email].get("provider", "missioninbox")
+    if email in missioninbox_email_set:
+        return "missioninbox"
     if email in zapmail_email_set:
         return "zapmail"
-    # Not in Mission Inbox credentials or ZapMail — client-owned account, skip silently
     return "unknown"
 
 
@@ -269,7 +280,7 @@ def _handle_missioninbox_disconnect(
     client: InstantlyClient,
     sheets: SheetsClient,
     slack: "SlackReporter",
-    creds_by_email: Dict,
+    missioninbox_client: Optional["MissionInboxClient"],
     alert_state: Dict,
     report: ReportData,
     cfg: Config,
@@ -290,7 +301,21 @@ def _handle_missioninbox_disconnect(
         return
 
     is_partial = (existing_row or {}).get("status") == "partial_reconnect_failure"
-    creds      = creds_by_email.get(email)
+
+    # Fetch live credentials from Mission Inbox API
+    creds = None
+    if missioninbox_client:
+        creds = missioninbox_client.get_credentials(email)
+    if not creds:
+        logger.error(
+            "MissionInbox: could not fetch credentials for %s (%s) — cannot reconnect.",
+            email, ws_name,
+        )
+        report.still_disconnected.append({
+            "email": email, "workspace_name": ws_name,
+            "provider": "missioninbox", "attempts": current_attempts,
+        })
+        return
 
     logger.info(
         "Attempting %s reconnect for %s (%s), attempt #%d",
