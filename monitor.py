@@ -28,7 +28,7 @@ from sheets_client import SheetsClient
 from slack_reporter import SlackReporter, ReportData, WorkspaceSummary
 from state import (
     is_new_disconnection,
-    should_realert_zapmail,
+    should_realert,
     build_new_alert_state_row,
     build_reconnect_failed_row,
     utcnow_str,
@@ -212,7 +212,7 @@ def run(send_report: bool = False) -> None:
                     # Unknown provider — client-owned account we don't manage.
                     # Alert once, then re-alert every 24 hours if still disconnected.
                     is_new   = is_new_disconnection(email, alert_state)
-                    re_alert = should_realert_zapmail(email, alert_state, realert_hours=24)
+                    re_alert = should_realert(email, alert_state, realert_hours=24)
                     if is_new or re_alert:
                         new_client_disconnections.append({"email": email, "workspace_name": ws_name})
                         existing_row = alert_state.get(email, {})
@@ -324,13 +324,13 @@ def _handle_missioninbox_disconnect(
         # No API key configured or API call failed — cannot auto-reconnect.
         # Alert once per 24h so the team knows it needs manual attention.
         is_new   = is_new_disconnection(email, alert_state)
-        re_alert = should_realert_zapmail(email, alert_state, realert_hours=24)
+        re_alert = should_realert(email, alert_state, realert_hours=24)
         if is_new or re_alert:
             logger.warning(
                 "MissionInbox: no credentials available for %s (%s) — sending alert.",
                 email, ws_name,
             )
-            slack.send_zapmail_alert(email, ws_name, reconnect_attempted=False)
+            slack.send_manual_reconnect_alert(email, ws_name, "Mission Inbox", reconnect_attempted=False)
             new_row = build_new_alert_state_row(email, ws_name)
             if existing_row:
                 new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
@@ -451,7 +451,7 @@ def _handle_zapmail_disconnect(
 
     # ── No client or max attempts reached — fall back to alert-once ──────────
     is_new      = is_new_disconnection(email, alert_state)
-    should_real = should_realert_zapmail(email, alert_state, cfg.zapmail_realert_hours)
+    should_real = should_realert(email, alert_state, cfg.zapmail_realert_hours)
 
     if is_new or should_real:
         no_client_reason = (

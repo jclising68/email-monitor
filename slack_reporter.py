@@ -56,26 +56,32 @@ class SlackReporter:
 
     # ── Public: immediate alert ───────────────────────────────────────────────
 
-    def send_zapmail_alert(self, email: str, workspace_name: str,
-                           reconnect_attempted: bool = False) -> bool:
-        """Send the one-time ZapMail disconnection alert."""
+    def send_manual_reconnect_alert(self, email: str, workspace_name: str,
+                                    provider: str, reconnect_attempted: bool = False) -> bool:
+        """Send a one-time disconnection alert for any provider requiring manual action."""
         detected = _now_pht()
+        provider_label = provider.title()
         if reconnect_attempted:
-            action = ":warning: Auto-reconnect via ZapMail API failed. Log in to Instantly and reconnect manually."
+            action = f":warning: Auto-reconnect via {provider_label} API failed. Log in to Instantly and reconnect manually."
         else:
             action = ":warning: Log in to Instantly and reconnect manually."
         text = (
-            f":rotating_light: *ZapMail Account Disconnected*\n"
+            f":rotating_light: *{provider_label} Account Disconnected*\n"
             f"*Account:* {email}\n"
             f"*Workspace:* {workspace_name}\n"
-            f"*Provider:* ZapMail\n"
+            f"*Provider:* {provider_label}\n"
             f"*Detected:* {detected}\n"
             f"{action}"
         )
         success = self._send(text)
         if success:
-            logger.info("Slack ZapMail alert sent for %s (%s)", email, workspace_name)
+            logger.info("Slack %s alert sent for %s (%s)", provider_label, email, workspace_name)
         return success
+
+    def send_zapmail_alert(self, email: str, workspace_name: str,
+                           reconnect_attempted: bool = False) -> bool:
+        """Backwards-compatible alias — use send_manual_reconnect_alert instead."""
+        return self.send_manual_reconnect_alert(email, workspace_name, "ZapMail", reconnect_attempted)
 
     def send_client_accounts_disconnected(self, accounts: list) -> bool:
         """
@@ -125,7 +131,7 @@ class SlackReporter:
         if attempts >= max_attempts:
             note = f":x: Max attempts ({max_attempts}) reached — *manual action required*. Log in to Instantly and reconnect."
         else:
-            note = f":warning: Will retry next hourly check (attempt {attempts}/{max_attempts})."
+            note = f":warning: Will retry next check (attempt {attempts}/{max_attempts})."
         text = (
             f":x: *Reconnect failed*\n"
             f"*Account:* {email}\n"
@@ -185,6 +191,14 @@ class ReportData:
         return sum(w.connected for w in self.workspace_summaries)
 
     @property
+    def total_warmup(self) -> int:
+        return sum(w.warmup for w in self.workspace_summaries)
+
+    @property
+    def total_paused(self) -> int:
+        return sum(w.paused for w in self.workspace_summaries)
+
+    @property
     def total_disconnected(self) -> int:
         return sum(w.disconnected for w in self.workspace_summaries)
 
@@ -220,12 +234,16 @@ def _format_daily_report(r: ReportData) -> str:
         lines.append("_No workspaces checked._")
 
     lines.append("")
-    lines.append(
-        f"*TOTALS:* {r.total_workspaces} workspaces | "
-        f"{r.total_connected} connected | "
-        f"{r.total_disconnected} disconnected | "
-        f"{r.total_dns_issues} DNS issues"
-    )
+    totals = [
+        f"{r.total_workspaces} workspaces",
+        f"{r.total_connected} connected",
+    ]
+    if r.total_warmup:
+        totals.append(f"{r.total_warmup} warmup")
+    if r.total_paused:
+        totals.append(f"{r.total_paused} paused")
+    totals += [f"{r.total_disconnected} disconnected", f"{r.total_dns_issues} DNS issues"]
+    lines.append(f"*TOTALS:* " + " | ".join(totals))
 
     # ── Workspace errors ──
     if r.workspace_errors:
@@ -239,7 +257,8 @@ def _format_daily_report(r: ReportData) -> str:
     if r.reconnected:
         lines.append(":white_check_mark: *Auto-Reconnected*")
         for item in r.reconnected:
-            provider_tag = " _(ZapMail)_" if item.get("provider") == "zapmail" else ""
+            provider = item.get("provider", "")
+            provider_tag = f" _({provider.replace('missioninbox', 'Mission Inbox').title()})_" if provider else ""
             lines.append(f"• {item['email']} ({item['workspace_name']}){provider_tag}")
     else:
         lines.append(":white_check_mark: *Auto-Reconnected*")
@@ -252,10 +271,12 @@ def _format_daily_report(r: ReportData) -> str:
         for item in r.still_disconnected:
             provider = item.get("provider", "unknown")
             attempts = item.get("attempts", 0)
-            if provider == "zapmail":
-                note = "ZapMail, manual action required"
+            label = {"zapmail": "ZapMail", "missioninbox": "Mission Inbox"}.get(provider, "")
+            if provider in ("zapmail", "missioninbox") and attempts == 0:
+                note = f"{label}, manual action required"
             elif attempts > 0:
-                note = f"Reconnect failed ({attempts} attempt{'s' if attempts != 1 else ''})"
+                suffix = f" ({label})" if label else ""
+                note = f"Reconnect failed ({attempts} attempt{'s' if attempts != 1 else ''}){suffix}"
             else:
                 note = "Disconnected"
             lines.append(f"• {item['email']} ({item['workspace_name']}) — {note}")

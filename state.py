@@ -40,11 +40,10 @@ def is_new_disconnection(email: str, alert_state: Dict[str, Dict]) -> bool:
     return email.lower() not in alert_state
 
 
-def should_realert_zapmail(email: str, alert_state: Dict[str, Dict], realert_hours: int) -> bool:
+def should_realert(email: str, alert_state: Dict[str, Dict], realert_hours: int) -> bool:
     """
-    Return True if we should send another ZapMail alert based on
-    the ZAPMAIL_REALERT_HOURS setting and the last_alerted timestamp.
-    If realert_hours == 0 (default), never re-alert.
+    Return True if enough time has elapsed since the last alert to re-alert.
+    If realert_hours == 0, never re-alert.
     """
     if realert_hours <= 0:
         return False
