@@ -196,7 +196,7 @@ def run(send_report: bool = False) -> None:
 
             else:
                 summary.disconnected += 1
-                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set)
+                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set, account)
 
                 if provider == "missioninbox":
                     _handle_missioninbox_disconnect(
@@ -255,22 +255,36 @@ def run(send_report: bool = False) -> None:
 
 # ── Disconnect handlers ───────────────────────────────────────────────────────
 
+_MI_HOST_MARKERS = ("outboxment.com", "inboxment.com")
+
+
 def _resolve_provider(
     email: str,
     missioninbox_email_set: set,
     zapmail_email_set: set,
+    account: Dict,
 ) -> str:
     """
     Determine provider for a disconnected account.
     Priority:
-      1. If email is in Mission Inbox's live mailbox list → missioninbox
-      2. If email is in ZapMail's live mailbox list → zapmail
-      3. Otherwise → client-owned account, do not reconnect
+      1. Mission Inbox API email list (most reliable — when API key is configured)
+      2. Instantly account's own smtp_host / imap_host fields — outboxment.com = Mission Inbox
+         (works even when Mission Inbox API key is not configured)
+      3. ZapMail live mailbox list
+      4. Unknown — client-owned account, do not reconnect
     """
     if email in missioninbox_email_set:
         return "missioninbox"
+
+    # Detect from the connection settings Instantly already stores per account
+    for host_field in ("smtp_host", "imap_host"):
+        host = str(account.get(host_field) or "").lower()
+        if any(marker in host for marker in _MI_HOST_MARKERS):
+            return "missioninbox"
+
     if email in zapmail_email_set:
         return "zapmail"
+
     return "unknown"
 
 
@@ -307,13 +321,30 @@ def _handle_missioninbox_disconnect(
     if missioninbox_client:
         creds = missioninbox_client.get_credentials(email)
     if not creds:
-        logger.error(
-            "MissionInbox: could not fetch credentials for %s (%s) — cannot reconnect.",
-            email, ws_name,
-        )
+        # No API key configured or API call failed — cannot auto-reconnect.
+        # Alert once per 24h so the team knows it needs manual attention.
+        is_new   = is_new_disconnection(email, alert_state)
+        re_alert = should_realert_zapmail(email, alert_state, realert_hours=24)
+        if is_new or re_alert:
+            logger.warning(
+                "MissionInbox: no credentials available for %s (%s) — sending alert.",
+                email, ws_name,
+            )
+            slack.send_zapmail_alert(email, ws_name, reconnect_attempted=False)
+            new_row = build_new_alert_state_row(email, ws_name)
+            if existing_row:
+                new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
+            new_row["status"] = "missioninbox_no_api_key"
+            try:
+                sheets.upsert_alert_state(**new_row)
+                alert_state[email] = new_row
+            except Exception as exc:
+                logger.error("Failed to write alert_state for MI no-key %s: %s", email, exc)
+        else:
+            logger.debug("MissionInbox %s (%s) — already alerted within 24h, silent.", email, ws_name)
         report.still_disconnected.append({
             "email": email, "workspace_name": ws_name,
-            "provider": "missioninbox", "attempts": current_attempts,
+            "provider": "missioninbox", "attempts": 0,
         })
         return
 
