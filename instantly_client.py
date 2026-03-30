@@ -238,6 +238,45 @@ class InstantlyClient:
             logger.warning("Unexpected error during vitals check for %s: %s", email, exc)
             return None
 
+    # ── Warmup analytics ─────────────────────────────────────────────────────
+
+    def get_warmup_analytics(
+        self,
+        emails: List[str],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Dict:
+        """
+        GET /accounts/analytics/warmup — warmup performance for given accounts.
+
+        Returns per-email per-day data and aggregate data including:
+          - health_score (0-100), health_score_label ("97%")
+          - sent, received, landed_inbox, landed_spam
+
+        Emails are batched in groups of 50 to stay within URL length limits.
+        """
+        all_aggregate: Dict = {}
+        batch_size = 50
+
+        for i in range(0, len(emails), batch_size):
+            batch = emails[i : i + batch_size]
+            params: Dict = {"emails": batch}
+            if start_date:
+                params["start_date"] = start_date
+            if end_date:
+                params["end_date"] = end_date
+
+            try:
+                result = self._request("GET", "/accounts/analytics/warmup", params=params)
+                agg = result.get("aggregate_data", {})
+                all_aggregate.update(agg)
+            except InstantlyAPIError as exc:
+                logger.warning("Warmup analytics batch failed (batch %d): %s", i // batch_size, exc)
+            except Exception as exc:
+                logger.warning("Warmup analytics unexpected error: %s", exc)
+
+        return all_aggregate
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod

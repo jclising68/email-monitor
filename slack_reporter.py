@@ -142,6 +142,43 @@ class SlackReporter:
         )
         return self._send(text)
 
+    # ── Public: health alerts ────────────────────────────────────────────────
+
+    def send_health_alert(self, email: str, workspace_name: str,
+                          health_score: int, spam_rate: float,
+                          is_critical: bool = False) -> bool:
+        """Immediate alert when an account's warmup health drops below threshold."""
+        severity = "CRITICAL" if is_critical else "WARNING"
+        emoji = ":red_circle:" if is_critical else ":large_orange_circle:"
+        action = (
+            "*Auto-pause recommended.* This account may be damaging domain reputation."
+            if is_critical
+            else "Monitor closely — health may recover, or consider pausing."
+        )
+        text = (
+            f"{emoji} *Warmup Health {severity}*\n"
+            f"*Account:* {email}\n"
+            f"*Workspace:* {workspace_name}\n"
+            f"*Health Score:* {health_score}%\n"
+            f"*Spam Rate:* {spam_rate:.1f}%\n"
+            f"*Time:* {_now_pht()}\n"
+            f"{action}"
+        )
+        return self._send(text)
+
+    def send_spam_rate_alert(self, email: str, workspace_name: str,
+                             spam_rate: float, landed_spam: int, landed_inbox: int) -> bool:
+        """Immediate alert when spam rate exceeds threshold."""
+        text = (
+            f":rotating_light: *High Spam Rate Detected*\n"
+            f"*Account:* {email}\n"
+            f"*Workspace:* {workspace_name}\n"
+            f"*Spam Rate:* {spam_rate:.1f}% ({landed_spam} spam / {landed_inbox + landed_spam} total)\n"
+            f"*Time:* {_now_pht()}\n"
+            f":warning: Investigate deliverability — consider pausing this account."
+        )
+        return self._send(text)
+
     # ── Public: daily report ──────────────────────────────────────────────────
 
     def send_daily_report(self, report_data: "ReportData") -> bool:
@@ -150,6 +187,16 @@ class SlackReporter:
         success = self._send(text)
         if success:
             logger.info("Slack daily report sent.")
+        return success
+
+    # ── Public: weekly domain health report ──────────────────────────────────
+
+    def send_weekly_domain_report(self, report_data: "ReportData") -> bool:
+        """Format and send the weekly domain health Slack message."""
+        text = _format_weekly_domain_report(report_data)
+        success = self._send(text)
+        if success:
+            logger.info("Slack weekly domain health report sent.")
         return success
 
 
@@ -181,6 +228,14 @@ class ReportData:
 
         # Workspace-level errors (bad API key, network, etc.)
         self.workspace_errors: List[Dict] = []    # [{workspace_name, error}]
+
+        # Health score alerts (low warmup health)
+        # [{email, workspace_name, health_score, spam_rate}]
+        self.health_alerts: List[Dict] = []
+
+        # Domain health data (for weekly report)
+        # [{domain, workspace_name, avg_health, total_inbox, total_spam, spam_rate, account_count, dns_status}]
+        self.domain_health: List[Dict] = []
 
     @property
     def total_workspaces(self) -> int:
@@ -285,6 +340,22 @@ def _format_daily_report(r: ReportData) -> str:
     else:
         lines.append(":white_check_mark: *All accounts connected.*")
 
+    # ── Health alerts ──
+    lines.append("")
+    if r.health_alerts:
+        lines.append(":thermometer: *Warmup Health Alerts*")
+        for item in sorted(r.health_alerts, key=lambda x: x.get("health_score", 100)):
+            score = item.get("health_score", "?")
+            spam = item.get("spam_rate", 0)
+            emoji = ":red_circle:" if score != "?" and score < 60 else ":large_orange_circle:"
+            lines.append(
+                f"• {emoji} {item['email']} ({item['workspace_name']}) — "
+                f"Health: {score}%, Spam rate: {spam:.1f}%"
+            )
+    else:
+        lines.append(":thermometer: *Warmup Health*")
+        lines.append("_All accounts healthy._")
+
     # ── DNS issues ──
     lines.append("")
     if r.dns_failures:
@@ -295,5 +366,67 @@ def _format_daily_report(r: ReportData) -> str:
     else:
         lines.append(":shield: *DNS Issues*")
         lines.append("_None detected._")
+
+    return "\n".join(lines)
+
+
+def _format_weekly_domain_report(r: ReportData) -> str:
+    """Format the weekly domain health report."""
+    lines: List[str] = []
+
+    lines.append(":globe_with_meridians: *Instantly Email Monitor — Weekly Domain Health Report*")
+    lines.append(f":calendar: {r.generated_at}")
+    lines.append("")
+
+    if not r.domain_health:
+        lines.append("_No domain health data available._")
+        return "\n".join(lines)
+
+    # Sort by health score ascending (worst first)
+    sorted_domains = sorted(r.domain_health, key=lambda d: d.get("avg_health", 100))
+
+    # Split into bad (< 85%) and healthy
+    bad_domains = [d for d in sorted_domains if d.get("avg_health", 100) < 85]
+    healthy_domains = [d for d in sorted_domains if d.get("avg_health", 100) >= 85]
+
+    if bad_domains:
+        lines.append(":warning: *Domains Needing Attention*")
+        for d in bad_domains:
+            dns_tag = ""
+            dns_status = d.get("dns_status", [])
+            if dns_status:
+                dns_tag = f" | DNS: Missing {', '.join(dns_status)}"
+            lines.append(
+                f"• :red_circle: *{d['domain']}* ({d['workspace_name']})\n"
+                f"   Health: {d['avg_health']:.0f}% | "
+                f"Spam rate: {d['spam_rate']:.1f}% | "
+                f"Accounts: {d['account_count']}{dns_tag}"
+            )
+        lines.append("")
+
+    lines.append(":white_check_mark: *All Domains*")
+    for d in sorted_domains:
+        emoji = ":red_circle:" if d.get("avg_health", 100) < 60 else (
+            ":large_orange_circle:" if d.get("avg_health", 100) < 85 else ":green_circle:"
+        )
+        dns_tag = ""
+        dns_status = d.get("dns_status", [])
+        if dns_status:
+            dns_tag = f" | DNS: :x: {', '.join(dns_status)}"
+        lines.append(
+            f"• {emoji} `{d['domain']}` ({d['workspace_name']}) — "
+            f"Health: {d['avg_health']:.0f}% | "
+            f"Spam: {d['spam_rate']:.1f}% ({d.get('total_spam', 0)} of {d.get('total_inbox', 0) + d.get('total_spam', 0)}) | "
+            f"{d['account_count']} account{'s' if d['account_count'] != 1 else ''}{dns_tag}"
+        )
+
+    # Summary line
+    lines.append("")
+    total_domains = len(sorted_domains)
+    total_bad = len(bad_domains)
+    if total_bad:
+        lines.append(f":bar_chart: *Summary:* {total_domains} domains total, {total_bad} need attention")
+    else:
+        lines.append(f":bar_chart: *Summary:* {total_domains} domains — all healthy")
 
     return "\n".join(lines)

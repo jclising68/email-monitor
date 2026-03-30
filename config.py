@@ -73,6 +73,19 @@ class Config:
             "ZAPMAIL_API_BASE_URL", required=False, default="https://api.zapmail.ai/api"
         )
 
+        # Health score thresholds (from warmup analytics)
+        self.health_score_alert_threshold: int = int(
+            get_env("HEALTH_SCORE_ALERT_THRESHOLD", required=False, default="80")
+        )
+        self.health_score_critical_threshold: int = int(
+            get_env("HEALTH_SCORE_CRITICAL_THRESHOLD", required=False, default="60")
+        )
+
+        # Spam rate threshold (percentage, 0-100). Alert if 7-day spam rate exceeds this.
+        self.spam_rate_alert_threshold: int = int(
+            get_env("SPAM_RATE_ALERT_THRESHOLD", required=False, default="10")
+        )
+
     def configure_logging(self):
         logging.basicConfig(
             level=getattr(logging, self.log_level, logging.INFO),

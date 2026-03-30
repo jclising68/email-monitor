@@ -2,14 +2,17 @@
 monitor.py — Orchestration entry point.
 
 Usage:
-  python monitor.py            # Hourly check + auto-reconnect
-  python monitor.py --report   # Daily report: run check first, then post to Slack
+  python monitor.py                  # Hourly check + auto-reconnect
+  python monitor.py --report         # Daily report: run check first, then post to Slack
+  python monitor.py --weekly-report  # Weekly domain health report
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 try:
@@ -38,8 +41,8 @@ from zapmail_client import ZapMailClient
 logger = logging.getLogger(__name__)
 
 
-def run(send_report: bool = False) -> None:
-    logger.info("=== Email Monitor starting (report=%s) ===", send_report)
+def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
+    logger.info("=== Email Monitor starting (report=%s, weekly=%s) ===", send_report, send_weekly_report)
 
     sheets = SheetsClient(_cfg.google_credentials, _cfg.google_sheets_id)
     slack  = SlackReporter(_cfg.slack_webhook_url)
@@ -234,6 +237,31 @@ def run(send_report: bool = False) -> None:
                             email, ws_name,
                         )
 
+        # ── Warmup health analytics ──────────────────────────────────────────
+        # Collect all emails for health check (connected + warmup accounts only)
+        all_emails = [
+            str(a.get("email", "")).strip().lower()
+            for a in accounts
+            if client.is_connected(a) and str(a.get("email", "")).strip()
+        ]
+
+        if all_emails:
+            end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            start_date = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+            try:
+                warmup_agg = client.get_warmup_analytics(all_emails, start_date, end_date)
+                _process_warmup_health(
+                    warmup_agg, ws_name, accounts, slack, report, _cfg,
+                    send_weekly_report=send_weekly_report,
+                    dns_failures_by_domain={
+                        f["domain"]: f["missing"]
+                        for f in report.dns_failures
+                        if f.get("workspace_name") == ws_name
+                    },
+                )
+            except Exception as exc:
+                logger.warning("Warmup analytics failed for %s: %s (non-fatal)", ws_name, exc)
+
         report.workspace_summaries.append(summary)
         logger.info(
             "Workspace %s: %d connected, %d warmup, %d paused, %d disconnected, %d DNS issues.",
@@ -248,6 +276,11 @@ def run(send_report: bool = False) -> None:
     if send_report:
         logger.info("Sending daily Slack report.")
         slack.send_daily_report(report)
+
+    # ── Weekly domain health report ──────────────────────────────────────────
+    if send_weekly_report:
+        logger.info("Sending weekly domain health report.")
+        slack.send_weekly_domain_report(report)
 
     logger.info("=== Email Monitor finished ===")
 
@@ -301,6 +334,99 @@ def _resolve_provider(
         return "zapmail"
 
     return "unknown"
+
+
+def _process_warmup_health(
+    warmup_agg: Dict,
+    ws_name: str,
+    accounts: List[Dict],
+    slack: "SlackReporter",
+    report: ReportData,
+    cfg: "Config",
+    send_weekly_report: bool = False,
+    dns_failures_by_domain: Optional[Dict[str, List[str]]] = None,
+) -> None:
+    """
+    Process warmup analytics aggregate data for one workspace.
+
+    - Sends immediate Slack alerts for accounts below health thresholds
+    - Sends immediate Slack alerts for high spam rates
+    - Aggregates domain-level health for weekly report
+    """
+    dns_failures_by_domain = dns_failures_by_domain or {}
+
+    # Per-domain aggregation for weekly report
+    domain_data: Dict[str, Dict] = defaultdict(lambda: {
+        "total_inbox": 0, "total_spam": 0,
+        "health_scores": [], "account_count": 0,
+    })
+
+    for email, agg in warmup_agg.items():
+        health_score = agg.get("health_score")
+        landed_inbox = agg.get("landed_inbox", 0)
+        landed_spam  = agg.get("landed_spam", 0)
+        total = landed_inbox + landed_spam
+
+        # Calculate spam rate
+        spam_rate = (landed_spam / total * 100) if total > 0 else 0.0
+
+        domain = email.split("@")[-1] if "@" in email else ""
+
+        # Aggregate for domain report
+        if domain:
+            dd = domain_data[domain]
+            dd["total_inbox"] += landed_inbox
+            dd["total_spam"] += landed_spam
+            dd["account_count"] += 1
+            if health_score is not None:
+                dd["health_scores"].append(health_score)
+
+        # ── Immediate health score alerts ─────────────────────────────────
+        if health_score is not None and health_score < cfg.health_score_alert_threshold:
+            is_critical = health_score < cfg.health_score_critical_threshold
+            logger.warning(
+                "Health %s for %s (%s): score=%d, spam_rate=%.1f%%",
+                "CRITICAL" if is_critical else "WARNING",
+                email, ws_name, health_score, spam_rate,
+            )
+            slack.send_health_alert(email, ws_name, health_score, spam_rate, is_critical)
+            report.health_alerts.append({
+                "email": email, "workspace_name": ws_name,
+                "health_score": health_score, "spam_rate": spam_rate,
+            })
+
+        # ── Immediate spam rate alerts ────────────────────────────────────
+        elif total > 0 and spam_rate >= cfg.spam_rate_alert_threshold:
+            logger.warning(
+                "High spam rate for %s (%s): %.1f%% (%d spam of %d total)",
+                email, ws_name, spam_rate, landed_spam, total,
+            )
+            slack.send_spam_rate_alert(email, ws_name, spam_rate, landed_spam, landed_inbox)
+            report.health_alerts.append({
+                "email": email, "workspace_name": ws_name,
+                "health_score": health_score or 0, "spam_rate": spam_rate,
+            })
+
+    # ── Build domain health entries (always, for daily + weekly reports) ───
+    for domain, dd in domain_data.items():
+        total = dd["total_inbox"] + dd["total_spam"]
+        avg_health = (
+            sum(dd["health_scores"]) / len(dd["health_scores"])
+            if dd["health_scores"] else 100.0
+        )
+        spam_rate = (dd["total_spam"] / total * 100) if total > 0 else 0.0
+        dns_status = dns_failures_by_domain.get(domain, [])
+
+        report.domain_health.append({
+            "domain": domain,
+            "workspace_name": ws_name,
+            "avg_health": avg_health,
+            "total_inbox": dd["total_inbox"],
+            "total_spam": dd["total_spam"],
+            "spam_rate": spam_rate,
+            "account_count": dd["account_count"],
+            "dns_status": dns_status,
+        })
 
 
 def _handle_missioninbox_disconnect(
@@ -505,9 +631,13 @@ def main() -> None:
         "--report", action="store_true",
         help="Run checks then send the daily Slack summary report",
     )
+    parser.add_argument(
+        "--weekly-report", action="store_true",
+        help="Run checks then send the weekly domain health report",
+    )
     args = parser.parse_args()
     try:
-        run(send_report=args.report)
+        run(send_report=args.report, send_weekly_report=args.weekly_report)
     except Exception as exc:
         logger.critical("Unhandled exception — monitor crashed: %s", exc, exc_info=True)
         try:

@@ -2,12 +2,17 @@ name: Email Monitor
 
 on:
   schedule:
-    - cron: '0 0,2,4,6,8,10,12,14,16,18,20,22 * * *'   # Every 2 hours — check + auto-reconnect (closest to 90 min in cron)
-    - cron: '0 4 * * *'                                  # 4 AM UTC = 12 PM Philippines — daily report
+    - cron: '0 0,2,4,6,8,10,12,14,16,18,20,22 * * *'   # Every 2 hours — check + auto-reconnect
+    - cron: '0 4 * * *'                                  # 4 AM UTC = 12 PM PHT — daily report
+    - cron: '0 4 * * 1'                                  # Monday 4 AM UTC = Monday 12 PM PHT — weekly domain report
   workflow_dispatch:       # Allow manual runs from GitHub UI
     inputs:
       report:
         description: 'Send daily Slack report?'
+        required: false
+        default: 'false'
+      weekly_report:
+        description: 'Send weekly domain health report?'
         required: false
         default: 'false'
 
@@ -37,10 +42,20 @@ jobs:
           ZAPMAIL_API_KEY:          ${{ secrets.ZAPMAIL_API_KEY }}
           MAX_RECONNECT_ATTEMPTS:   '5'
           ZAPMAIL_REALERT_HOURS:    '0'
+          HEALTH_SCORE_ALERT_THRESHOLD: '80'
+          HEALTH_SCORE_CRITICAL_THRESHOLD: '60'
+          SPAM_RATE_ALERT_THRESHOLD: '10'
           LOG_LEVEL:                'INFO'
         run: |
-          # Daily report: fires at 4 AM UTC or when manually requested
-          if [ "${{ github.event.schedule }}" = "0 4 * * *" ] || [ "${{ github.event.inputs.report }}" = "true" ]; then
+          SCHEDULE="${{ github.event.schedule }}"
+          DAY_OF_WEEK=$(date -u +%u)  # 1=Monday
+
+          # Weekly domain health report: Monday 4 AM UTC or manual
+          if [ "${{ github.event.inputs.weekly_report }}" = "true" ] || ([ "$SCHEDULE" = "0 4 * * 1" ]); then
+            echo "Running weekly domain health report..."
+            python monitor.py --weekly-report
+          # Daily report: 4 AM UTC (non-Monday) or manual
+          elif [ "${{ github.event.inputs.report }}" = "true" ] || ([ "$SCHEDULE" = "0 4 * * *" ] && [ "$DAY_OF_WEEK" != "1" ]); then
             echo "Running daily report..."
             python monitor.py --report
           else
