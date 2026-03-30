@@ -196,7 +196,7 @@ def run(send_report: bool = False) -> None:
 
             else:
                 summary.disconnected += 1
-                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set, account)
+                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set, account, missioninbox_client is not None)
 
                 if provider == "missioninbox":
                     _handle_missioninbox_disconnect(
@@ -263,24 +263,27 @@ def _resolve_provider(
     missioninbox_email_set: set,
     zapmail_email_set: set,
     account: Dict,
+    has_mi_client: bool,
 ) -> str:
     """
     Determine provider for a disconnected account.
-    Priority:
-      1. Mission Inbox API email list (most reliable — when API key is configured)
-      2. Instantly account's own smtp_host / imap_host fields — outboxment.com = Mission Inbox
-         (works even when Mission Inbox API key is not configured)
-      3. ZapMail live mailbox list
-      4. Unknown — client-owned account, do not reconnect
-    """
-    if email in missioninbox_email_set:
-        return "missioninbox"
+    Mission Inbox detection ONLY runs when the workspace has a Mission Inbox
+    API key configured — workspaces without MI (e.g. Lead Assassin, StableSea)
+    are not affected.
 
-    # Detect from the connection settings Instantly already stores per account
-    for host_field in ("smtp_host", "imap_host"):
-        host = str(account.get(host_field) or "").lower()
-        if any(marker in host for marker in _MI_HOST_MARKERS):
+    Priority:
+      1. If MI API key configured: check MI email list, then account SMTP/IMAP host
+      2. ZapMail live mailbox list
+      3. Unknown — client-owned account, do not reconnect
+    """
+    if has_mi_client:
+        if email in missioninbox_email_set:
             return "missioninbox"
+        # Detect from the connection settings Instantly stores per account
+        for host_field in ("smtp_host", "imap_host"):
+            host = str(account.get(host_field) or "").lower()
+            if any(marker in host for marker in _MI_HOST_MARKERS):
+                return "missioninbox"
 
     if email in zapmail_email_set:
         return "zapmail"
