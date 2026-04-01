@@ -285,9 +285,9 @@ def _format_daily_report(r: ReportData) -> str:
         max_name_len = max(len(w.name) for w in r.workspace_summaries)
         for w in sorted(r.workspace_summaries, key=lambda x: x.name):
             pad = max_name_len - len(w.name)
-            parts = [f"{w.connected} active"]
-            if w.warmup:
-                parts.append(f"{w.warmup} warmup")
+            total_online = w.connected + w.warmup
+            warmup_tag = f" ({w.warmup} warmup)" if w.warmup else ""
+            parts = [f"{total_online} connected{warmup_tag}"]
             if w.paused:
                 parts.append(f"{w.paused} paused")
             parts.append(f"{w.disconnected} disconnected")
@@ -297,12 +297,12 @@ def _format_daily_report(r: ReportData) -> str:
         lines.append("_No workspaces checked._")
 
     lines.append("")
+    total_online = r.total_connected + r.total_warmup
+    warmup_tag = f" ({r.total_warmup} warmup)" if r.total_warmup else ""
     totals = [
         f"{r.total_workspaces} workspaces",
-        f"{r.total_connected} active",
+        f"{total_online} connected{warmup_tag}",
     ]
-    if r.total_warmup:
-        totals.append(f"{r.total_warmup} warmup")
     if r.total_paused:
         totals.append(f"{r.total_paused} paused")
     totals += [f"{r.total_disconnected} disconnected", f"{r.total_dns_issues} DNS issues"]
