@@ -285,7 +285,7 @@ def _format_daily_report(r: ReportData) -> str:
         max_name_len = max(len(w.name) for w in r.workspace_summaries)
         for w in sorted(r.workspace_summaries, key=lambda x: x.name):
             pad = max_name_len - len(w.name)
-            parts = [f"{w.connected} connected"]
+            parts = [f"{w.connected} active"]
             if w.warmup:
                 parts.append(f"{w.warmup} warmup")
             if w.paused:
@@ -299,7 +299,7 @@ def _format_daily_report(r: ReportData) -> str:
     lines.append("")
     totals = [
         f"{r.total_workspaces} workspaces",
-        f"{r.total_connected} connected",
+        f"{r.total_connected} active",
     ]
     if r.total_warmup:
         totals.append(f"{r.total_warmup} warmup")
