@@ -230,11 +230,11 @@ class ReportData:
         self.workspace_errors: List[Dict] = []    # [{workspace_name, error}]
 
         # Health score alerts (low warmup health)
-        # [{email, workspace_name, health_score, spam_rate}]
+        # [{email, workspace_name, health_score}]
         self.health_alerts: List[Dict] = []
 
         # Domain health data (for weekly report)
-        # [{domain, workspace_name, avg_health, total_inbox, total_spam, spam_rate, account_count, dns_status}]
+        # [{domain, workspace_name, avg_health, account_count, dns_status}]
         self.domain_health: List[Dict] = []
 
         # Tracking domain issues
@@ -354,11 +354,10 @@ def _format_daily_report(r: ReportData) -> str:
         lines.append(":thermometer: *Warmup Health Alerts*")
         for item in sorted(r.health_alerts, key=lambda x: x.get("health_score", 100)):
             score = item.get("health_score", "?")
-            spam = item.get("spam_rate", 0)
             emoji = ":red_circle:" if score != "?" and score < 60 else ":large_orange_circle:"
             lines.append(
                 f"• {emoji} {item['email']} ({item['workspace_name']}) — "
-                f"Health: {score}%, Spam rate: {spam:.1f}%"
+                f"Health: {score}%"
             )
     else:
         lines.append(":thermometer: *Warmup Health*")
@@ -424,7 +423,6 @@ def _format_weekly_domain_report(r: ReportData) -> str:
             lines.append(
                 f"• :red_circle: *{d['domain']}* ({d['workspace_name']})\n"
                 f"   Health: {d['avg_health']:.0f}% | "
-                f"Spam rate: {d['spam_rate']:.1f}% | "
                 f"Accounts: {d['account_count']}{dns_tag}"
             )
         lines.append("")
@@ -441,7 +439,6 @@ def _format_weekly_domain_report(r: ReportData) -> str:
         lines.append(
             f"• {emoji} `{d['domain']}` ({d['workspace_name']}) — "
             f"Health: {d['avg_health']:.0f}% | "
-            f"Spam: {d['spam_rate']:.1f}% ({d.get('total_spam', 0)} of {d.get('total_inbox', 0) + d.get('total_spam', 0)}) | "
             f"{d['account_count']} account{'s' if d['account_count'] != 1 else ''}{dns_tag}"
         )
 

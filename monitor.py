@@ -273,20 +273,15 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             except Exception:
                 pass  # non-fatal — tracking domain check is best-effort
 
-        # ── Warmup health analytics (separate from reconnect flow) ────────
-        all_connected_emails = [
-            str(a.get("email", "")).strip().lower()
-            for a in accounts
-            if client.is_connected(a) and str(a.get("email", "")).strip()
+        # ── Warmup health (extracted from account data, no extra API call) ─
+        connected_accounts = [
+            a for a in accounts if client.is_connected(a)
         ]
-
-        if all_connected_emails:
-            end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            start_date = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        if connected_accounts:
             try:
-                warmup_agg = client.get_warmup_analytics(all_connected_emails, start_date, end_date)
+                warmup_health = client.extract_warmup_health(connected_accounts)
                 _process_warmup_health(
-                    warmup_agg, ws_name, report, _cfg,
+                    warmup_health, ws_name, report, _cfg,
                     dns_failures_by_domain={
                         f["domain"]: f["missing"]
                         for f in report.dns_failures
@@ -294,7 +289,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     },
                 )
             except Exception as exc:
-                logger.warning("Warmup analytics failed for %s: %s (non-fatal)", ws_name, exc)
+                logger.warning("Warmup health processing failed for %s: %s (non-fatal)", ws_name, exc)
 
         # ── Campaign bounce rate check ────────────────────────────────────
         try:
@@ -380,91 +375,65 @@ def _resolve_provider(
 
 
 def _process_warmup_health(
-    warmup_agg: Dict,
+    warmup_health: Dict,
     ws_name: str,
     report: ReportData,
     cfg: "Config",
     dns_failures_by_domain: Optional[Dict[str, List[str]]] = None,
 ) -> None:
     """
-    Process warmup analytics aggregate data for one workspace.
+    Process warmup health scores from account data for one workspace.
 
-    Fully isolated from the reconnect flow — failures here never affect
-    account monitoring or auto-reconnect. Does NOT write to alert_state
+    Uses stat_warmup_score (0-100) from the account list — no extra API call.
+    Fully isolated from the reconnect flow. Does NOT write to alert_state
     or Sheets. Does NOT send individual Slack messages.
 
-    All health/spam issues are collected into report.health_alerts and
-    report.domain_health — they surface ONLY in the daily report and
-    weekly domain report. This guarantees zero Slack flooding.
+    All health issues are collected into report.health_alerts and
+    report.domain_health — they surface ONLY in the daily/weekly report.
     """
     dns_failures_by_domain = dns_failures_by_domain or {}
 
     # Per-domain aggregation
     domain_data: Dict[str, Dict] = defaultdict(lambda: {
-        "total_inbox": 0, "total_spam": 0,
         "health_scores": [], "account_count": 0,
     })
 
-    for email, agg in warmup_agg.items():
-        health_score = agg.get("health_score")
-        landed_inbox = agg.get("landed_inbox", 0)
-        landed_spam  = agg.get("landed_spam", 0)
-        total = landed_inbox + landed_spam
-
-        # Calculate spam rate (guard against division by zero)
-        spam_rate = (landed_spam / total * 100) if total > 0 else 0.0
+    for email, data in warmup_health.items():
+        health_score = data.get("health_score")
+        if health_score is None:
+            continue
 
         domain = email.split("@")[-1] if "@" in email else ""
 
         # Aggregate for domain report
         if domain:
             dd = domain_data[domain]
-            dd["total_inbox"] += landed_inbox
-            dd["total_spam"] += landed_spam
             dd["account_count"] += 1
-            if health_score is not None:
-                dd["health_scores"].append(health_score)
+            dd["health_scores"].append(health_score)
 
         # ── Collect health issues (shown in daily report only) ────────────
-        if health_score is not None and health_score < cfg.health_score_alert_threshold:
+        if health_score < cfg.health_score_alert_threshold:
             logger.info(
-                "Low health for %s (%s): score=%d, spam_rate=%.1f%%",
-                email, ws_name, health_score, spam_rate,
+                "Low health for %s (%s): score=%d",
+                email, ws_name, health_score,
             )
             report.health_alerts.append({
                 "email": email, "workspace_name": ws_name,
-                "health_score": health_score, "spam_rate": spam_rate,
-            })
-
-        # ── Collect spam rate issues (shown in daily report only) ─────────
-        elif total > 0 and spam_rate >= cfg.spam_rate_alert_threshold:
-            logger.info(
-                "High spam rate for %s (%s): %.1f%% (%d spam of %d total)",
-                email, ws_name, spam_rate, landed_spam, total,
-            )
-            report.health_alerts.append({
-                "email": email, "workspace_name": ws_name,
-                "health_score": health_score if health_score is not None else 0,
-                "spam_rate": spam_rate,
+                "health_score": health_score,
             })
 
     # ── Build domain health entries (always, for daily + weekly reports) ───
     for domain, dd in domain_data.items():
-        total = dd["total_inbox"] + dd["total_spam"]
         avg_health = (
             sum(dd["health_scores"]) / len(dd["health_scores"])
             if dd["health_scores"] else 100.0
         )
-        spam_rate = (dd["total_spam"] / total * 100) if total > 0 else 0.0
         dns_status = dns_failures_by_domain.get(domain, [])
 
         report.domain_health.append({
             "domain": domain,
             "workspace_name": ws_name,
             "avg_health": avg_health,
-            "total_inbox": dd["total_inbox"],
-            "total_spam": dd["total_spam"],
-            "spam_rate": spam_rate,
             "account_count": dd["account_count"],
             "dns_status": dns_status,
         })

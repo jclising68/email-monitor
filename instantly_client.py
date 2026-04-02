@@ -238,44 +238,30 @@ class InstantlyClient:
             logger.warning("Unexpected error during vitals check for %s: %s", email, exc)
             return None
 
-    # ── Warmup analytics ─────────────────────────────────────────────────────
+    # ── Warmup health (from account data) ───────────────────────────────────
 
-    def get_warmup_analytics(
-        self,
-        emails: List[str],
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> Dict:
+    @staticmethod
+    def extract_warmup_health(accounts: List[Dict]) -> Dict[str, Dict]:
         """
-        GET /accounts/analytics/warmup — warmup performance for given accounts.
+        Extract warmup health scores from account data already fetched by
+        get_all_accounts(). No extra API call needed.
 
-        Returns per-email per-day data and aggregate data including:
-          - health_score (0-100), health_score_label ("97%")
-          - sent, received, landed_inbox, landed_spam
-
-        Emails are batched in groups of 50 to stay within URL length limits.
+        Each account has `stat_warmup_score` (0-100) in the response from
+        GET /accounts. Returns {email: {"health_score": int}} for all
+        connected accounts that have a warmup score.
         """
-        all_aggregate: Dict = {}
-        batch_size = 50
-
-        for i in range(0, len(emails), batch_size):
-            batch = emails[i : i + batch_size]
-            params: Dict = {"emails": batch}
-            if start_date:
-                params["start_date"] = start_date
-            if end_date:
-                params["end_date"] = end_date
-
-            try:
-                result = self._request("GET", "/accounts/analytics/warmup", params=params)
-                agg = result.get("aggregate_data", {})
-                all_aggregate.update(agg)
-            except InstantlyAPIError as exc:
-                logger.warning("Warmup analytics batch failed (batch %d): %s", i // batch_size, exc)
-            except Exception as exc:
-                logger.warning("Warmup analytics unexpected error: %s", exc)
-
-        return all_aggregate
+        result: Dict[str, Dict] = {}
+        for account in accounts:
+            email = str(account.get("email", "")).strip().lower()
+            if not email:
+                continue
+            score = account.get("stat_warmup_score")
+            if score is not None:
+                try:
+                    result[email] = {"health_score": int(score)}
+                except (ValueError, TypeError):
+                    pass
+        return result
 
     # ── Campaign analytics ─────────────────────────────────────────────────────
 
@@ -297,7 +283,7 @@ class InstantlyClient:
             params["start_date"] = start_date
         if end_date:
             params["end_date"] = end_date
-        params["exclude_total_leads_count"] = True  # faster response
+        params["exclude_total_leads_count"] = "true"  # must be lowercase string for API
 
         try:
             result = self._request("GET", "/campaigns/analytics", params=params)
