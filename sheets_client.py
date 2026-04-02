@@ -187,7 +187,7 @@ class SheetsClient:
         """
         Return list of active workspace dicts.
         Required columns : workspace_name, api_key, active
-        Optional columns : zapmail_workspace_key, zapmail_service_provider
+        Optional columns : zapmail_workspace_key_google, zapmail_workspace_key_microsoft, mission_inbox_api_key
         """
         ws = self._worksheet(TAB_WORKSPACES)
         rows = ws.get_all_records()  # no expected_headers — extra cols are optional
