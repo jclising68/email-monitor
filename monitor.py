@@ -86,33 +86,50 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         client  = InstantlyClient(api_key, base_url=_cfg.instantly_base_url)
         summary = WorkspaceSummary(ws_name)
 
-        # Build a ZapMail client for this workspace if it has a workspace ID configured
-        zapmail_client: Optional[ZapMailClient] = None
+        # Build ZapMail client(s) for this workspace.
+        # Supports multiple service providers (e.g. "GOOGLE,MICROSOFT") —
+        # one client per provider, with a merged email set and per-email
+        # client mapping so reconnect uses the correct provider header.
         zapmail_email_set: set = set()
+        zapmail_email_to_client: Dict[str, ZapMailClient] = {}
         zm_workspace_id = ws.get("zapmail_workspace_key", "")
         if zapmail_api_key and zm_workspace_id:
-            zapmail_client = ZapMailClient(
-                api_key=zapmail_api_key,
-                workspace_key=zm_workspace_id,
-                service_provider=ws.get("zapmail_service_provider", "GOOGLE"),
-                base_url=_cfg.zapmail_api_base_url,
-            )
-            try:
-                zm_mailboxes = zapmail_client.list_mailboxes()
-                zapmail_email_set = {
-                    str(mb.get("email", "")).lower()
-                    for mb in zm_mailboxes if mb.get("email")
-                }
+            providers = [
+                p.strip().upper()
+                for p in ws.get("zapmail_service_provider", "GOOGLE").split(",")
+                if p.strip()
+            ] or ["GOOGLE"]
+
+            for provider in providers:
+                zm_client = ZapMailClient(
+                    api_key=zapmail_api_key,
+                    workspace_key=zm_workspace_id,
+                    service_provider=provider,
+                    base_url=_cfg.zapmail_api_base_url,
+                )
+                try:
+                    zm_mailboxes = zm_client.list_mailboxes()
+                    for mb in zm_mailboxes:
+                        mb_email = str(mb.get("email", "")).lower().strip()
+                        if mb_email and mb_email not in zapmail_email_set:
+                            zapmail_email_set.add(mb_email)
+                            zapmail_email_to_client[mb_email] = zm_client
+                    logger.info(
+                        "ZapMail [%s]: workspace '%s' has %d mailbox(es).",
+                        provider, ws_name, len(zm_mailboxes),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "ZapMail [%s]: failed to list mailboxes for workspace '%s' (%s) — "
+                        "ZapMail %s reconnect disabled for this workspace.",
+                        provider, ws_name, exc, provider,
+                    )
+
+            if zapmail_email_set:
                 logger.info(
-                    "ZapMail: workspace '%s' has %d mailbox(es).",
-                    ws_name, len(zapmail_email_set),
+                    "ZapMail: workspace '%s' total %d unique mailbox(es) across %s.",
+                    ws_name, len(zapmail_email_set), ", ".join(providers),
                 )
-            except Exception as exc:
-                logger.error(
-                    "ZapMail: failed to list mailboxes for workspace '%s' (%s) — "
-                    "ZapMail reconnect disabled for this workspace.", ws_name, exc,
-                )
-                zapmail_client = None
 
         # Build a Mission Inbox client for this workspace if it has an API key configured
         missioninbox_client: Optional[MissionInboxClient] = None
@@ -207,8 +224,9 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     )
                 elif provider == "zapmail":
                     _handle_zapmail_disconnect(
-                        email, ws_name, zapmail_client, sheets, slack,
-                        alert_state, report, _cfg,
+                        email, ws_name,
+                        zapmail_email_to_client.get(email),  # correct client for this email's provider
+                        sheets, slack, alert_state, report, _cfg,
                     )
                 else:
                     # Unknown provider — client-owned account we don't manage.
