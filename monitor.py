@@ -87,23 +87,25 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         summary = WorkspaceSummary(ws_name)
 
         # Build ZapMail client(s) for this workspace.
-        # Supports multiple service providers (e.g. "GOOGLE,MICROSOFT") —
-        # one client per provider, with a merged email set and per-email
-        # client mapping so reconnect uses the correct provider header.
+        # Each provider (GOOGLE, MICROSOFT) has its own workspace key in the sheet.
+        # One client per provider, with a merged email set and per-email
+        # client mapping so reconnect uses the correct provider + workspace key.
         zapmail_email_set: set = set()
         zapmail_email_to_client: Dict[str, ZapMailClient] = {}
-        zm_workspace_id = ws.get("zapmail_workspace_key", "")
-        if zapmail_api_key and zm_workspace_id:
-            providers = [
-                p.strip().upper()
-                for p in ws.get("zapmail_service_provider", "GOOGLE").split(",")
-                if p.strip()
-            ] or ["GOOGLE"]
 
-            for provider in providers:
+        # Provider → workspace key mapping from sheet columns
+        _zm_provider_keys = {
+            "GOOGLE":    ws.get("zapmail_workspace_key_google", ""),
+            "MICROSOFT": ws.get("zapmail_workspace_key_microsoft", ""),
+        }
+
+        if zapmail_api_key:
+            for provider, wk in _zm_provider_keys.items():
+                if not wk:
+                    continue  # no workspace key for this provider — skip
                 zm_client = ZapMailClient(
                     api_key=zapmail_api_key,
-                    workspace_key=zm_workspace_id,
+                    workspace_key=wk,
                     service_provider=provider,
                     base_url=_cfg.zapmail_api_base_url,
                 )
@@ -126,9 +128,10 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     )
 
             if zapmail_email_set:
+                active_providers = [p for p, wk in _zm_provider_keys.items() if wk]
                 logger.info(
                     "ZapMail: workspace '%s' total %d unique mailbox(es) across %s.",
-                    ws_name, len(zapmail_email_set), ", ".join(providers),
+                    ws_name, len(zapmail_email_set), ", ".join(active_providers),
                 )
 
         # Build a Mission Inbox client for this workspace if it has an API key configured

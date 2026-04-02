@@ -204,9 +204,9 @@ class SheetsClient:
             result.append({
                 "workspace_name":           ws_name,
                 "api_key":                  api_key,
-                # Optional ZapMail columns — empty string if not present
-                "zapmail_workspace_key":    str(row.get("zapmail_workspace_key", "")).strip(),
-                "zapmail_service_provider": str(row.get("zapmail_service_provider", "GOOGLE")).strip().upper() or "GOOGLE",
+                # ZapMail workspace keys — one per provider, each optional
+                "zapmail_workspace_key_google":    str(row.get("zapmail_workspace_key_google", "")).strip(),
+                "zapmail_workspace_key_microsoft": str(row.get("zapmail_workspace_key_microsoft", "")).strip(),
                 # Optional Mission Inbox API key — empty string if not present
                 "mission_inbox_api_key":    str(row.get("mission_inbox_api_key", "")).strip(),
             })
