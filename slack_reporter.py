@@ -354,11 +354,22 @@ def _format_daily_report(r: ReportData) -> str:
         lines.append(":thermometer: *Warmup Health Alerts*")
         for item in sorted(r.health_alerts, key=lambda x: x.get("health_score", 100)):
             score = item.get("health_score", "?")
-            emoji = ":red_circle:" if score != "?" and score < 60 else ":large_orange_circle:"
-            lines.append(
+            if score != "?" and score < 60:
+                emoji = ":red_circle:"
+                action = "Consider pausing — low health damages domain reputation."
+            elif score != "?" and score < 80:
+                emoji = ":large_orange_circle:"
+                action = "Monitor closely — may recover, or consider reducing send volume."
+            else:
+                emoji = ":large_orange_circle:"
+                action = ""
+            line = (
                 f"• {emoji} {item['email']} ({item['workspace_name']}) — "
                 f"Health: {score}%"
             )
+            if action:
+                line += f"\n   :point_right: _{action}_"
+            lines.append(line)
     else:
         lines.append(":thermometer: *Warmup Health*")
         lines.append("_All accounts healthy._")
@@ -375,10 +386,17 @@ def _format_daily_report(r: ReportData) -> str:
         lines.append("")
         lines.append(":boom: *Campaign Bounce Alerts*")
         for item in sorted(r.bounce_alerts, key=lambda x: x.get("bounce_rate", 0), reverse=True):
+            severity = item.get("severity", "WARNING")
+            sev_emoji = ":red_circle:" if severity == "CRITICAL" else (
+                ":large_orange_circle:" if severity == "HIGH" else ":warning:"
+            )
+            reply_rate = item.get("reply_rate", 0)
             lines.append(
-                f"• {item['campaign_name']} ({item['workspace_name']}) — "
-                f"Bounce rate: {item['bounce_rate']:.1f}% "
-                f"({item['bounced']}/{item['sent']} emails)"
+                f"• {sev_emoji} *{item['campaign_name']}* ({item['workspace_name']})\n"
+                f"   Bounce: {item['bounce_rate']:.1f}% ({item['bounced']}/{item['sent']}) | "
+                f"Replies: {item.get('replies', 0)} ({reply_rate:.1f}%) | "
+                f"Leads: {item.get('contacted', 0)}/{item.get('total_leads', 0)}\n"
+                f"   :point_right: _{item.get('action', '')}_"
             )
 
     # ── DNS issues ──

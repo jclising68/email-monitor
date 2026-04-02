@@ -466,6 +466,7 @@ def _process_campaign_health(
     """
     Check campaign bounce rates. Fully isolated from reconnect flow.
     Only checks active campaigns (status=1) with meaningful send volume.
+    Includes full campaign context and severity-based action items.
     """
     for campaign in campaigns:
         status = campaign.get("campaign_status")
@@ -475,6 +476,10 @@ def _process_campaign_health(
         name = campaign.get("campaign_name", "Unknown")
         sent = campaign.get("emails_sent_count", 0)
         bounced = campaign.get("bounced_count", 0)
+        contacted = campaign.get("contacted_count", 0)
+        total_leads = campaign.get("leads_count", 0)
+        replies = campaign.get("reply_count_unique", campaign.get("reply_count", 0))
+        unsubscribed = campaign.get("unsubscribed_count", 0)
 
         # Need meaningful volume — at least 50 emails sent to judge bounce rate
         if sent < 50:
@@ -483,9 +488,22 @@ def _process_campaign_health(
         bounce_rate = (bounced / sent * 100) if sent > 0 else 0.0
 
         if bounce_rate >= cfg.bounce_rate_alert_threshold:
+            reply_rate = (replies / sent * 100) if sent > 0 else 0.0
+
+            # Severity-based action recommendation
+            if bounce_rate >= 15:
+                severity = "CRITICAL"
+                action = "Pause campaign immediately — high bounce rate is damaging sender reputation and domain health."
+            elif bounce_rate >= 10:
+                severity = "HIGH"
+                action = "Pause campaign and re-verify the lead list before resuming. Remove invalid contacts."
+            else:
+                severity = "WARNING"
+                action = "Review lead list quality. Consider re-verifying emails before sending more."
+
             logger.warning(
-                "High bounce rate for campaign '%s' (%s): %.1f%% (%d/%d)",
-                name, ws_name, bounce_rate, bounced, sent,
+                "High bounce rate for campaign '%s' (%s): %.1f%% (%d/%d) — %s",
+                name, ws_name, bounce_rate, bounced, sent, severity,
             )
             report.bounce_alerts.append({
                 "campaign_name": name,
@@ -493,6 +511,13 @@ def _process_campaign_health(
                 "bounce_rate": bounce_rate,
                 "bounced": bounced,
                 "sent": sent,
+                "contacted": contacted,
+                "total_leads": total_leads,
+                "reply_rate": reply_rate,
+                "replies": replies,
+                "unsubscribed": unsubscribed,
+                "severity": severity,
+                "action": action,
             })
 
 
