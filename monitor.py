@@ -299,7 +299,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             try:
                 warmup_health = client.extract_warmup_health(connected_accounts)
                 _process_warmup_health(
-                    warmup_health, ws_name, report, _cfg,
+                    warmup_health, ws_name, client, report, _cfg,
                     dns_failures_by_domain={
                         f["domain"]: f["missing"]
                         for f in report.dns_failures
@@ -314,7 +314,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             end_date_c = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             start_date_c = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
             campaigns = client.get_campaign_analytics(start_date_c, end_date_c)
-            _process_campaign_health(campaigns, ws_name, report, _cfg)
+            _process_campaign_health(campaigns, ws_name, client, report, _cfg)
         except Exception as exc:
             logger.warning("Campaign analytics failed for %s: %s (non-fatal)", ws_name, exc)
 
@@ -395,6 +395,7 @@ def _resolve_provider(
 def _process_warmup_health(
     warmup_health: Dict,
     ws_name: str,
+    client: "InstantlyClient",
     report: ReportData,
     cfg: "Config",
     dns_failures_by_domain: Optional[Dict[str, List[str]]] = None,
@@ -403,11 +404,14 @@ def _process_warmup_health(
     Process warmup health scores from account data for one workspace.
 
     Uses stat_warmup_score (0-100) from the account list — no extra API call.
-    Fully isolated from the reconnect flow. Does NOT write to alert_state
-    or Sheets. Does NOT send individual Slack messages.
+    Fully isolated from the reconnect flow.
+
+    Automated actions:
+      - Health < 60% (critical): auto-pauses the account in Instantly
+      - Health 60-80% (warning): alert only in daily report
 
     All health issues are collected into report.health_alerts and
-    report.domain_health — they surface ONLY in the daily/weekly report.
+    report.domain_health — they surface in the daily/weekly report.
     """
     dns_failures_by_domain = dns_failures_by_domain or {}
 
@@ -429,15 +433,38 @@ def _process_warmup_health(
             dd["account_count"] += 1
             dd["health_scores"].append(health_score)
 
-        # ── Collect health issues (shown in daily report only) ────────────
+        # ── Health below threshold — collect + auto-act ───────────────────
         if health_score < cfg.health_score_alert_threshold:
+            is_critical = health_score < cfg.health_score_critical_threshold
+            action_taken = ""
+
+            if is_critical:
+                # Auto-pause the account to protect domain reputation
+                try:
+                    paused = client.pause_account(email)
+                    if paused:
+                        action_taken = "Auto-paused in Instantly"
+                        logger.warning(
+                            "Auto-paused %s (%s) — health score %d%% is critical.",
+                            email, ws_name, health_score,
+                        )
+                    else:
+                        action_taken = "Auto-pause failed — pause manually in Instantly"
+                        logger.error("Failed to auto-pause %s (%s).", email, ws_name)
+                except Exception as exc:
+                    action_taken = "Auto-pause failed — pause manually in Instantly"
+                    logger.error("Error auto-pausing %s (%s): %s", email, ws_name, exc)
+            else:
+                action_taken = "Monitor closely — reduce send volume if it drops further"
+
             logger.info(
-                "Low health for %s (%s): score=%d",
-                email, ws_name, health_score,
+                "Low health for %s (%s): score=%d — %s",
+                email, ws_name, health_score, action_taken,
             )
             report.health_alerts.append({
                 "email": email, "workspace_name": ws_name,
                 "health_score": health_score,
+                "action_taken": action_taken,
             })
 
     # ── Build domain health entries (always, for daily + weekly reports) ───
@@ -460,13 +487,17 @@ def _process_warmup_health(
 def _process_campaign_health(
     campaigns: List[Dict],
     ws_name: str,
+    client: "InstantlyClient",
     report: ReportData,
     cfg: "Config",
 ) -> None:
     """
     Check campaign bounce rates. Fully isolated from reconnect flow.
     Only checks active campaigns (status=1) with meaningful send volume.
-    Includes full campaign context and severity-based action items.
+
+    Automated actions:
+      - Bounce ≥ 10%: auto-pauses the campaign in Instantly
+      - Bounce 5-10%: alert only in daily report
     """
     for campaign in campaigns:
         status = campaign.get("campaign_status")
@@ -474,12 +505,12 @@ def _process_campaign_health(
             continue
 
         name = campaign.get("campaign_name", "Unknown")
+        campaign_id = campaign.get("campaign_id", "")
         sent = campaign.get("emails_sent_count", 0)
         bounced = campaign.get("bounced_count", 0)
         contacted = campaign.get("contacted_count", 0)
         total_leads = campaign.get("leads_count", 0)
         replies = campaign.get("reply_count_unique", campaign.get("reply_count", 0))
-        unsubscribed = campaign.get("unsubscribed_count", 0)
 
         # Need meaningful volume — at least 50 emails sent to judge bounce rate
         if sent < 50:
@@ -489,21 +520,30 @@ def _process_campaign_health(
 
         if bounce_rate >= cfg.bounce_rate_alert_threshold:
             reply_rate = (replies / sent * 100) if sent > 0 else 0.0
+            action_taken = ""
 
-            # Severity-based action recommendation
-            if bounce_rate >= 15:
-                severity = "CRITICAL"
-                action = "Pause campaign immediately — high bounce rate is damaging sender reputation and domain health."
-            elif bounce_rate >= 10:
-                severity = "HIGH"
-                action = "Pause campaign and re-verify the lead list before resuming. Remove invalid contacts."
+            # Auto-pause campaigns with bounce ≥ 10%
+            if bounce_rate >= 10 and campaign_id:
+                try:
+                    paused = client.pause_campaign(campaign_id)
+                    if paused:
+                        action_taken = "Auto-paused campaign — re-verify lead list before resuming"
+                        logger.warning(
+                            "Auto-paused campaign '%s' (%s) — bounce rate %.1f%% exceeds 10%%.",
+                            name, ws_name, bounce_rate,
+                        )
+                    else:
+                        action_taken = "Auto-pause failed — pause manually in Instantly and re-verify lead list"
+                        logger.error("Failed to auto-pause campaign '%s' (%s).", name, ws_name)
+                except Exception as exc:
+                    action_taken = "Auto-pause failed — pause manually in Instantly and re-verify lead list"
+                    logger.error("Error auto-pausing campaign '%s' (%s): %s", name, ws_name, exc)
             else:
-                severity = "WARNING"
-                action = "Review lead list quality. Consider re-verifying emails before sending more."
+                action_taken = "Review lead list quality — consider re-verifying emails before sending more"
 
             logger.warning(
                 "High bounce rate for campaign '%s' (%s): %.1f%% (%d/%d) — %s",
-                name, ws_name, bounce_rate, bounced, sent, severity,
+                name, ws_name, bounce_rate, bounced, sent, action_taken,
             )
             report.bounce_alerts.append({
                 "campaign_name": name,
@@ -515,9 +555,7 @@ def _process_campaign_health(
                 "total_leads": total_leads,
                 "reply_rate": reply_rate,
                 "replies": replies,
-                "unsubscribed": unsubscribed,
-                "severity": severity,
-                "action": action,
+                "action_taken": action_taken,
             })
 
 

@@ -354,22 +354,13 @@ def _format_daily_report(r: ReportData) -> str:
         lines.append(":thermometer: *Warmup Health Alerts*")
         for item in sorted(r.health_alerts, key=lambda x: x.get("health_score", 100)):
             score = item.get("health_score", "?")
-            if score != "?" and score < 60:
-                emoji = ":red_circle:"
-                action = "Consider pausing — low health damages domain reputation."
-            elif score != "?" and score < 80:
-                emoji = ":large_orange_circle:"
-                action = "Monitor closely — may recover, or consider reducing send volume."
-            else:
-                emoji = ":large_orange_circle:"
-                action = ""
-            line = (
+            emoji = ":red_circle:" if score != "?" and score < 60 else ":large_orange_circle:"
+            action_taken = item.get("action_taken", "")
+            lines.append(
                 f"• {emoji} {item['email']} ({item['workspace_name']}) — "
-                f"Health: {score}%"
+                f"Health: {score}%\n"
+                f"   :point_right: _{action_taken}_"
             )
-            if action:
-                line += f"\n   :point_right: _{action}_"
-            lines.append(line)
     else:
         lines.append(":thermometer: *Warmup Health*")
         lines.append("_All accounts healthy._")
@@ -381,22 +372,21 @@ def _format_daily_report(r: ReportData) -> str:
         for item in r.tracking_domain_issues:
             lines.append(f"• {item['email']} ({item['workspace_name']}) — {item['issue']}")
 
-    # ── Bounce rate alerts ──
+    # ── Bounce rate alerts (only shown when issues exist) ──
     if r.bounce_alerts:
         lines.append("")
         lines.append(":boom: *Campaign Bounce Alerts*")
         for item in sorted(r.bounce_alerts, key=lambda x: x.get("bounce_rate", 0), reverse=True):
-            severity = item.get("severity", "WARNING")
-            sev_emoji = ":red_circle:" if severity == "CRITICAL" else (
-                ":large_orange_circle:" if severity == "HIGH" else ":warning:"
-            )
+            bounce_rate = item.get("bounce_rate", 0)
+            sev_emoji = ":red_circle:" if bounce_rate >= 10 else ":warning:"
             reply_rate = item.get("reply_rate", 0)
+            action_taken = item.get("action_taken", "")
             lines.append(
                 f"• {sev_emoji} *{item['campaign_name']}* ({item['workspace_name']})\n"
-                f"   Bounce: {item['bounce_rate']:.1f}% ({item['bounced']}/{item['sent']}) | "
+                f"   Bounce: {bounce_rate:.1f}% ({item['bounced']}/{item['sent']}) | "
                 f"Replies: {item.get('replies', 0)} ({reply_rate:.1f}%) | "
                 f"Leads: {item.get('contacted', 0)}/{item.get('total_leads', 0)}\n"
-                f"   :point_right: _{item.get('action', '')}_"
+                f"   :point_right: _{action_taken}_"
             )
 
     # ── DNS issues ──
