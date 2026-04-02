@@ -184,9 +184,27 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                 else:
                     summary.connected += 1
 
-                # Clear stale alert_state if account recovered
+                # Clear alert_state if account recovered
                 if email in alert_state:
-                    logger.info("Account %s (%s) recovered — clearing alert state.", email, ws_name)
+                    prev_status = alert_state[email].get("status", "")
+                    if prev_status == "reconnect_pending":
+                        # Reconnect from last run actually worked — confirm it now
+                        # Detect provider from email sets since sheet doesn't store it
+                        if email in missioninbox_email_set:
+                            prov, prov_label = "missioninbox", "Mission Inbox"
+                        elif email in zapmail_email_set:
+                            prov, prov_label = "zapmail", "ZapMail"
+                        else:
+                            prov, prov_label = "", ""
+                        logger.info("Account %s (%s) confirmed recovered after reconnect.", email, ws_name)
+                        if prov_label:
+                            slack.send_reconnect_success(email, ws_name, prov_label)
+                        report.reconnected.append({
+                            "email": email, "workspace_name": ws_name,
+                            "provider": prov,
+                        })
+                    else:
+                        logger.info("Account %s (%s) recovered — clearing alert state.", email, ws_name)
                     try:
                         sheets.delete_alert_state(email)
                         del alert_state[email]
@@ -493,6 +511,27 @@ def _handle_missioninbox_disconnect(
     existing_row    = alert_state.get(email)
     current_attempts = int((existing_row or {}).get("reconnect_attempts", 0))
 
+    # ── If last reconnect is pending confirmation, check if it failed ────
+    if existing_row and existing_row.get("status") == "reconnect_pending":
+        new_attempts = current_attempts + 1
+        logger.warning(
+            "MI reconnect for %s (%s) did not hold — still disconnected. "
+            "Attempt %d/%d.", email, ws_name, new_attempts, cfg.max_reconnect_attempts,
+        )
+        slack.send_reconnect_failed(email, ws_name, "Mission Inbox", new_attempts, cfg.max_reconnect_attempts)
+        new_row = build_reconnect_failed_row(email, ws_name, existing_row, new_attempts)
+        new_row["status"] = "reconnect_failed"
+        try:
+            sheets.upsert_alert_state(**new_row)
+            alert_state[email] = new_row
+        except Exception as exc:
+            logger.error("Failed to write alert_state for MI pending %s: %s", email, exc)
+        report.still_disconnected.append({
+            "email": email, "workspace_name": ws_name,
+            "provider": "missioninbox", "attempts": new_attempts,
+        })
+        return
+
     if current_attempts >= cfg.max_reconnect_attempts:
         logger.warning(
             "Account %s (%s) has hit max reconnect attempts (%d). Skipping.",
@@ -543,7 +582,9 @@ def _handle_missioninbox_disconnect(
         "POST-only" if is_partial else "full",
         email, ws_name, current_attempts + 1,
     )
-    slack.send_reconnect_attempting(email, ws_name, "Mission Inbox")
+    # Only send Slack "Attempting" on first attempt to avoid noise
+    if current_attempts == 0:
+        slack.send_reconnect_attempting(email, ws_name, "Mission Inbox")
 
     if is_partial:
         success = attempt_post_only(client, email, creds)
@@ -552,14 +593,21 @@ def _handle_missioninbox_disconnect(
         success, partial = attempt_reconnect(client, email, creds)
 
     if success:
-        logger.info("Reconnect succeeded for %s (%s).", email, ws_name)
-        slack.send_reconnect_success(email, ws_name, "Mission Inbox")
-        report.reconnected.append({"email": email, "workspace_name": ws_name, "provider": "missioninbox"})
+        # Don't celebrate yet — mark as pending and verify on NEXT run.
+        logger.info(
+            "MI reconnect API succeeded for %s (%s) — will verify on next run.",
+            email, ws_name,
+        )
+        new_row = build_reconnect_failed_row(email, ws_name, existing_row, current_attempts + 1)
+        new_row["status"] = "reconnect_pending"
         try:
-            sheets.delete_alert_state(email)
-            alert_state.pop(email, None)
+            sheets.upsert_alert_state(**new_row)
+            # Extra fields for in-memory use only (not written to sheet)
+            new_row["provider"] = "missioninbox"
+            new_row["provider_label"] = "Mission Inbox"
+            alert_state[email] = new_row
         except Exception as exc:
-            logger.error("Failed to clear alert_state after reconnect of %s: %s", email, exc)
+            logger.error("Failed to write alert_state for MI pending %s: %s", email, exc)
     else:
         new_attempts = current_attempts + 1
         status       = "partial_reconnect_failure" if partial else "reconnect_failed"
@@ -598,27 +646,60 @@ def _handle_zapmail_disconnect(
     existing_row     = alert_state.get(email)
     current_attempts = int((existing_row or {}).get("reconnect_attempts", 0))
 
+    # ── If last reconnect is pending confirmation, check if it failed ────────
+    if existing_row and existing_row.get("status") == "reconnect_pending":
+        # Account is STILL disconnected after last run's "successful" reconnect.
+        # The reconnect didn't actually work. Count it as a failed attempt.
+        new_attempts = current_attempts + 1
+        logger.warning(
+            "ZapMail reconnect for %s (%s) did not hold — still disconnected. "
+            "Attempt %d/%d.", email, ws_name, new_attempts, cfg.max_reconnect_attempts,
+        )
+        slack.send_reconnect_failed(email, ws_name, "ZapMail", new_attempts, cfg.max_reconnect_attempts)
+        new_row = build_reconnect_failed_row(email, ws_name, existing_row, new_attempts)
+        new_row["status"] = "zapmail_reconnect_failed"
+        try:
+            sheets.upsert_alert_state(**new_row)
+            alert_state[email] = new_row
+        except Exception as exc:
+            logger.error("Failed to write alert_state for ZapMail %s: %s", email, exc)
+        report.still_disconnected.append({
+            "email": email, "workspace_name": ws_name,
+            "provider": "zapmail", "attempts": new_attempts,
+        })
+        return
+
     # ── Try auto-reconnect ────────────────────────────────────────────────────
     if zapmail_client and current_attempts < cfg.max_reconnect_attempts:
         logger.info(
             "Attempting ZapMail reconnect for %s (%s), attempt #%d",
             email, ws_name, current_attempts + 1,
         )
-        slack.send_reconnect_attempting(email, ws_name, "ZapMail")
+        # Only send Slack "Attempting" on first attempt to avoid noise
+        if current_attempts == 0:
+            slack.send_reconnect_attempting(email, ws_name, "ZapMail")
         success = zapmail_client.reconnect_email(email)
 
         if success:
-            logger.info("ZapMail reconnect succeeded for %s (%s).", email, ws_name)
-            slack.send_reconnect_success(email, ws_name, "ZapMail")
-            report.reconnected.append({"email": email, "workspace_name": ws_name, "provider": "zapmail"})
+            # Don't celebrate yet — mark as pending and verify on NEXT run.
+            # If the account is actually connected next run, we confirm then.
+            logger.info(
+                "ZapMail export succeeded for %s (%s) — will verify on next run.",
+                email, ws_name,
+            )
+            new_row = build_reconnect_failed_row(email, ws_name, existing_row, current_attempts + 1)
+            new_row["status"] = "reconnect_pending"
             try:
-                sheets.delete_alert_state(email)
-                alert_state.pop(email, None)
+                sheets.upsert_alert_state(**new_row)
+                # Extra fields for in-memory use only (not written to sheet)
+                new_row["provider"] = "zapmail"
+                new_row["provider_label"] = "ZapMail"
+                alert_state[email] = new_row
             except Exception as exc:
-                logger.error("Failed to clear alert_state after ZapMail reconnect of %s: %s", email, exc)
-            return  # done — do NOT add to still_disconnected
+                logger.error("Failed to write alert_state for ZapMail pending %s: %s", email, exc)
+            return  # wait for next run to confirm
 
-        # Reconnect failed — track attempts
+        # Reconnect API call itself failed
         new_attempts = current_attempts + 1
         logger.warning(
             "ZapMail reconnect failed for %s (%s). Attempt %d/%d.",
