@@ -218,6 +218,8 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                         else:
                             prov, prov_label = "", ""
                         logger.info("Account %s (%s) confirmed recovered after reconnect.", email, ws_name)
+                        if prov_label:
+                            slack.send_reconnect_success(email, ws_name, prov_label)
                         report.reconnected.append({
                             "email": email, "workspace_name": ws_name,
                             "provider": prov,
@@ -659,7 +661,8 @@ def _handle_missioninbox_disconnect(
         "POST-only" if is_partial else "full",
         email, ws_name, current_attempts + 1,
     )
-    # All reconnect notifications go through daily report only — no real-time Slack
+    if current_attempts == 0:
+        slack.send_reconnect_attempting(email, ws_name, "Mission Inbox")
 
     if is_partial:
         success = attempt_post_only(client, email, creds)
@@ -748,7 +751,8 @@ def _handle_zapmail_disconnect(
             "Attempting ZapMail reconnect for %s (%s), attempt #%d",
             email, ws_name, current_attempts + 1,
         )
-        # All reconnect notifications go through daily report only — no real-time Slack
+        if current_attempts == 0:
+            slack.send_reconnect_attempting(email, ws_name, "ZapMail")
         success, permanent_failure = zapmail_client.reconnect_email(email)
 
         if success:
