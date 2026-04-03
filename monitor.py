@@ -218,8 +218,6 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                         else:
                             prov, prov_label = "", ""
                         logger.info("Account %s (%s) confirmed recovered after reconnect.", email, ws_name)
-                        if prov_label:
-                            slack.send_reconnect_success(email, ws_name, prov_label)
                         report.reconnected.append({
                             "email": email, "workspace_name": ws_name,
                             "provider": prov,
@@ -272,11 +270,9 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     )
                 else:
                     # Unknown provider — client-owned account we don't manage.
-                    # Alert once, then re-alert every 24 hours if still disconnected.
-                    is_new   = is_new_disconnection(email, alert_state)
-                    re_alert = should_realert(email, alert_state, realert_hours=24)
-                    if is_new or re_alert:
-                        new_client_disconnections.append({"email": email, "workspace_name": ws_name})
+                    # Track in alert_state and show in daily report.
+                    is_new = is_new_disconnection(email, alert_state)
+                    if is_new:
                         existing_row = alert_state.get(email, {})
                         new_row = {
                             "email": email.lower(),
@@ -291,11 +287,11 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                             alert_state[email] = new_row
                         except Exception as exc:
                             logger.error("Failed to write alert_state for client account %s: %s", email, exc)
-                    else:
-                        logger.debug(
-                            "Client account %s (%s) still disconnected — alerted within 24h, silent.",
-                            email, ws_name,
-                        )
+                    # Always add to report so it shows in daily report
+                    report.still_disconnected.append({
+                        "email": email, "workspace_name": ws_name,
+                        "provider": "client", "attempts": 0,
+                    })
 
         # ── Tracking domain status check (data already in accounts) ────────
         for account in accounts:
@@ -345,9 +341,8 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             ws_name, summary.connected, summary.warmup, summary.paused, summary.disconnected, summary.dns_issues,
         )
 
-    # ── Send batched client disconnection alert (one message for all) ─────────
-    if new_client_disconnections:
-        slack.send_client_accounts_disconnected(new_client_disconnections)
+    # ── Client disconnections go in daily report (no real-time alert) ─────────
+    # new_client_disconnections is already tracked in report via still_disconnected
 
     # ── Daily report ──────────────────────────────────────────────────────────
     if send_report:
@@ -602,7 +597,6 @@ def _handle_missioninbox_disconnect(
             "MI reconnect for %s (%s) did not hold — still disconnected. "
             "Attempt %d/%d.", email, ws_name, new_attempts, cfg.max_reconnect_attempts,
         )
-        slack.send_reconnect_failed(email, ws_name, "Mission Inbox", new_attempts, cfg.max_reconnect_attempts)
         new_row = build_reconnect_failed_row(email, ws_name, existing_row, new_attempts)
         new_row["status"] = "reconnect_failed"
         try:
@@ -643,7 +637,6 @@ def _handle_missioninbox_disconnect(
                 "MissionInbox: no credentials available for %s (%s) — sending alert.",
                 email, ws_name,
             )
-            slack.send_manual_reconnect_alert(email, ws_name, "Mission Inbox", reconnect_attempted=False)
             new_row = build_new_alert_state_row(email, ws_name)
             if existing_row:
                 new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
@@ -666,9 +659,7 @@ def _handle_missioninbox_disconnect(
         "POST-only" if is_partial else "full",
         email, ws_name, current_attempts + 1,
     )
-    # Only send Slack "Attempting" on first attempt to avoid noise
-    if current_attempts == 0:
-        slack.send_reconnect_attempting(email, ws_name, "Mission Inbox")
+    # All reconnect notifications go through daily report only — no real-time Slack
 
     if is_partial:
         success = attempt_post_only(client, email, creds)
@@ -699,7 +690,6 @@ def _handle_missioninbox_disconnect(
             "Reconnect failed for %s (%s). Attempts: %d. Status: %s",
             email, ws_name, new_attempts, status,
         )
-        slack.send_reconnect_failed(email, ws_name, "Mission Inbox", new_attempts, cfg.max_reconnect_attempts)
         report.still_disconnected.append({
             "email": email, "workspace_name": ws_name,
             "provider": "missioninbox", "attempts": new_attempts,
@@ -739,7 +729,6 @@ def _handle_zapmail_disconnect(
             "ZapMail reconnect for %s (%s) did not hold — still disconnected. "
             "Attempt %d/%d.", email, ws_name, new_attempts, cfg.max_reconnect_attempts,
         )
-        slack.send_reconnect_failed(email, ws_name, "ZapMail", new_attempts, cfg.max_reconnect_attempts)
         new_row = build_reconnect_failed_row(email, ws_name, existing_row, new_attempts)
         new_row["status"] = "zapmail_reconnect_failed"
         try:
@@ -759,9 +748,7 @@ def _handle_zapmail_disconnect(
             "Attempting ZapMail reconnect for %s (%s), attempt #%d",
             email, ws_name, current_attempts + 1,
         )
-        # Only send Slack "Attempting" on first attempt to avoid noise
-        if current_attempts == 0:
-            slack.send_reconnect_attempting(email, ws_name, "ZapMail")
+        # All reconnect notifications go through daily report only — no real-time Slack
         success, permanent_failure = zapmail_client.reconnect_email(email)
 
         if success:
@@ -797,7 +784,6 @@ def _handle_zapmail_disconnect(
             "ZapMail reconnect failed for %s (%s). Attempt %d/%d.",
             email, ws_name, new_attempts, cfg.max_reconnect_attempts,
         )
-        slack.send_reconnect_failed(email, ws_name, "ZapMail", new_attempts, cfg.max_reconnect_attempts)
         new_row = build_reconnect_failed_row(email, ws_name, existing_row, new_attempts)
         new_row["status"] = "zapmail_reconnect_failed"
         try:
@@ -824,7 +810,6 @@ def _handle_zapmail_disconnect(
         logger.info(
             "Sending ZapMail alert for %s (%s) — %s.", email, ws_name, no_client_reason
         )
-        slack.send_zapmail_alert(email, ws_name, reconnect_attempted=False)
 
         new_row = build_new_alert_state_row(email, ws_name)
         if existing_row:
