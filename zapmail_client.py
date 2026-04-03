@@ -167,19 +167,26 @@ class ZapMailClient:
             payload["status"] = status
         return self._request("POST", "/v2/exports/mailboxes", json=payload)
 
-    def reconnect_email(self, email: str) -> bool:
+    # Errors that mean "don't retry — needs manual fix in ZapMail"
+    _PERMANENT_ERRORS = ("invalid account credentials", "unauthorized", "forbidden")
+
+    def reconnect_email(self, email: str) -> tuple:
         """
         Find the mailbox in ZapMail by email, then re-export it to Instantly.
-        Returns True on success, False on any failure.
+
+        Returns (success: bool, permanent_failure: bool)
+          - (True, False)  = export API succeeded
+          - (False, True)  = permanent error, don't retry (e.g. invalid credentials)
+          - (False, False)  = transient error, retry might help
         """
         try:
             mailbox = self.find_mailbox_by_email(email)
         except ZapMailAPIError as exc:
             logger.error("ZapMail: failed to list mailboxes for %s: %s", email, exc)
-            return False
+            return False, False
         except Exception as exc:
             logger.error("ZapMail: unexpected error listing mailboxes for %s: %s", email, exc)
-            return False
+            return False, False
 
         if not mailbox:
             logger.warning(
@@ -187,7 +194,7 @@ class ZapMailClient:
                 "Check that this email exists in the ZapMail workspace.",
                 email, self._workspace_key,
             )
-            return False
+            return False, True  # permanent: mailbox doesn't exist
 
         # ZapMail may use 'id', '_id', or 'mailboxId'
         mailbox_id = (
@@ -201,18 +208,22 @@ class ZapMailClient:
                 "ZapMail: mailbox for %s has no usable ID field. Keys: %s",
                 email, list(mailbox.keys()),
             )
-            return False
+            return False, True
 
         try:
             self.export_mailboxes(mailbox_ids=[str(mailbox_id)])
             logger.info("ZapMail: successfully re-exported %s to Instantly.", email)
-            return True
+            return True, False
         except ZapMailAPIError as exc:
-            logger.error("ZapMail: export failed for %s: %s", email, exc)
-            return False
+            is_permanent = any(pe in str(exc).lower() for pe in self._PERMANENT_ERRORS)
+            if is_permanent:
+                logger.error("ZapMail: PERMANENT export failure for %s: %s — will not retry.", email, exc)
+            else:
+                logger.error("ZapMail: export failed for %s: %s", email, exc)
+            return False, is_permanent
         except Exception as exc:
             logger.error("ZapMail: unexpected export error for %s: %s", email, exc)
-            return False
+            return False, False
 
     # ── One-time setup ────────────────────────────────────────────────────────
 

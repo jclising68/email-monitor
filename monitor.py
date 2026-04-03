@@ -762,11 +762,10 @@ def _handle_zapmail_disconnect(
         # Only send Slack "Attempting" on first attempt to avoid noise
         if current_attempts == 0:
             slack.send_reconnect_attempting(email, ws_name, "ZapMail")
-        success = zapmail_client.reconnect_email(email)
+        success, permanent_failure = zapmail_client.reconnect_email(email)
 
         if success:
             # Don't celebrate yet — mark as pending and verify on NEXT run.
-            # If the account is actually connected next run, we confirm then.
             logger.info(
                 "ZapMail export succeeded for %s (%s) — will verify on next run.",
                 email, ws_name,
@@ -775,7 +774,6 @@ def _handle_zapmail_disconnect(
             new_row["status"] = "reconnect_pending"
             try:
                 sheets.upsert_alert_state(**new_row)
-                # Extra fields for in-memory use only (not written to sheet)
                 new_row["provider"] = "zapmail"
                 new_row["provider_label"] = "ZapMail"
                 alert_state[email] = new_row
@@ -783,8 +781,18 @@ def _handle_zapmail_disconnect(
                 logger.error("Failed to write alert_state for ZapMail pending %s: %s", email, exc)
             return  # wait for next run to confirm
 
-        # Reconnect API call itself failed
-        new_attempts = current_attempts + 1
+        # Reconnect failed
+        if permanent_failure:
+            # Permanent error (e.g. invalid credentials) — skip to max so we don't
+            # waste 5 retries on something that needs manual ZapMail fix.
+            new_attempts = cfg.max_reconnect_attempts
+            logger.warning(
+                "ZapMail permanent failure for %s (%s) — skipping to max attempts. "
+                "Fix the Instantly credentials in ZapMail.", email, ws_name,
+            )
+        else:
+            new_attempts = current_attempts + 1
+
         logger.warning(
             "ZapMail reconnect failed for %s (%s). Attempt %d/%d.",
             email, ws_name, new_attempts, cfg.max_reconnect_attempts,
