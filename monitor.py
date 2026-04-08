@@ -53,7 +53,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         workspaces = sheets.get_workspaces()
     except Exception as exc:
         logger.critical("Cannot read 'workspaces' sheet: %s", exc)
-        slack._send(f":fire: *Email Monitor CRITICAL:* Cannot read workspaces sheet: {exc}")
+        slack.send_crash_alert(f"Cannot read workspaces sheet: {exc}")
         sys.exit(1)
 
     try:
@@ -74,8 +74,6 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         if send_report:
             slack.send_daily_report(report)
         return
-
-    new_client_disconnections: List[Dict] = []  # batched for single Slack message
 
     # ── Per-workspace processing ──────────────────────────────────────────────
     for ws in workspaces:
@@ -189,6 +187,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             continue
 
         checked_domains: set = set()  # DNS is per-domain; only check one email per domain
+        connected_accounts: List[Dict] = []  # collected in main loop for warmup health
 
         for account in accounts:
             email: str = str(account.get("email", "")).strip().lower()
@@ -200,6 +199,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             in_warmup = connected and client.is_warming_up(account)
 
             if connected:
+                connected_accounts.append(account)
                 if in_warmup:
                     summary.warmup += 1
                 else:
@@ -209,8 +209,6 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                 if email in alert_state:
                     prev_status = alert_state[email].get("status", "")
                     if prev_status == "reconnect_pending":
-                        # Reconnect from last run actually worked — confirm it now
-                        # Detect provider from email sets since sheet doesn't store it
                         if email in missioninbox_email_set:
                             prov, prov_label = "missioninbox", "Mission Inbox"
                         elif email in zapmail_email_set:
@@ -251,9 +249,19 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     except Exception as exc:
                         logger.warning("DNS check failed for %s: %s (non-fatal)", domain, exc)
 
+                # Tracking domain check (data already in account object, no API call)
+                try:
+                    td_issue = client.has_tracking_domain_issue(account)
+                    if td_issue:
+                        report.tracking_domain_issues.append({
+                            "email": email, "workspace_name": ws_name,
+                            "issue": td_issue,
+                        })
+                except Exception:
+                    pass
+
             elif paused:
                 summary.paused += 1
-                # Intentionally paused — skip silently, no reconnect, no alert
 
             else:
                 summary.disconnected += 1
@@ -267,12 +275,10 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                 elif provider == "zapmail":
                     _handle_zapmail_disconnect(
                         email, ws_name,
-                        zapmail_email_to_client.get(email),  # correct client for this email's provider
+                        zapmail_email_to_client.get(email),
                         sheets, slack, alert_state, report, _cfg,
                     )
                 else:
-                    # Unknown provider — client-owned account we don't manage.
-                    # Track in alert_state and show in daily report.
                     is_new = is_new_disconnection(email, alert_state)
                     if is_new:
                         existing_row = alert_state.get(email, {})
@@ -289,31 +295,12 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                             alert_state[email] = new_row
                         except Exception as exc:
                             logger.error("Failed to write alert_state for client account %s: %s", email, exc)
-                    # Always add to report so it shows in daily report
                     report.still_disconnected.append({
                         "email": email, "workspace_name": ws_name,
                         "provider": "client", "attempts": 0,
                     })
 
-        # ── Tracking domain status check (data already in accounts) ────────
-        for account in accounts:
-            email_td = str(account.get("email", "")).strip().lower()
-            if not email_td or not client.is_connected(account):
-                continue
-            try:
-                td_issue = client.has_tracking_domain_issue(account)
-                if td_issue:
-                    report.tracking_domain_issues.append({
-                        "email": email_td, "workspace_name": ws_name,
-                        "issue": td_issue,
-                    })
-            except Exception:
-                pass  # non-fatal — tracking domain check is best-effort
-
         # ── Warmup health (extracted from account data, no extra API call) ─
-        connected_accounts = [
-            a for a in accounts if client.is_connected(a)
-        ]
         if connected_accounts:
             try:
                 warmup_health = client.extract_warmup_health(connected_accounts)
@@ -342,9 +329,6 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             "Workspace %s: %d connected, %d warmup, %d paused, %d disconnected, %d DNS issues.",
             ws_name, summary.connected, summary.warmup, summary.paused, summary.disconnected, summary.dns_issues,
         )
-
-    # ── Client disconnections go in daily report (no real-time alert) ─────────
-    # new_client_disconnections is already tracked in report via still_disconnected
 
     # ── Daily report ──────────────────────────────────────────────────────────
     if send_report:
@@ -852,10 +836,8 @@ def main() -> None:
     except Exception as exc:
         logger.critical("Unhandled exception — monitor crashed: %s", exc, exc_info=True)
         try:
-            SlackReporter(_cfg.slack_webhook_url)._send(
-                f":fire: *Email Monitor CRASHED*\n"
-                f"Unhandled error: `{exc}`\n"
-                f"Check GitHub Actions logs for full traceback."
+            SlackReporter(_cfg.slack_webhook_url).send_crash_alert(
+                f"Unhandled error: `{exc}`\nCheck GitHub Actions logs for full traceback."
             )
         except Exception:
             pass

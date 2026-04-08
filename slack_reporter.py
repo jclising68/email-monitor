@@ -29,11 +29,28 @@ class SlackReporter:
 
     # ── Internal send ─────────────────────────────────────────────────────────
 
+    _SLACK_MAX_CHARS = 39000  # Slack limit is 40K; leave margin
+
     def _send(self, text: str) -> bool:
         """
         POST message to Slack webhook.
+        Auto-splits messages that exceed Slack's character limit.
         Returns True on success, False on failure (never raises — monitoring must continue).
         """
+        if len(text) <= self._SLACK_MAX_CHARS:
+            return self._post(text)
+        # Split on double-newline (section boundaries) to avoid breaking mid-line
+        chunks = self._split_message(text)
+        ok = True
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                chunk = f"_(continued {i+1}/{len(chunks)})_\n{chunk}"
+            if not self._post(chunk):
+                ok = False
+        return ok
+
+    def _post(self, text: str) -> bool:
+        """Single POST to Slack webhook."""
         try:
             resp = requests.post(
                 self._webhook_url,
@@ -53,6 +70,29 @@ class SlackReporter:
         except Exception as exc:
             logger.error("Failed to send Slack message: %s", exc)
             return False
+
+    @classmethod
+    def _split_message(cls, text: str) -> List[str]:
+        """Split a long message into chunks at section boundaries."""
+        sections = text.split("\n\n")
+        chunks: List[str] = []
+        current = ""
+        for section in sections:
+            candidate = f"{current}\n\n{section}" if current else section
+            if len(candidate) > cls._SLACK_MAX_CHARS and current:
+                chunks.append(current)
+                current = section
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks or [text]
+
+    # ── Public: crash / critical alerts ────────────────────────────────────────
+
+    def send_crash_alert(self, detail: str) -> bool:
+        """Send a critical/crash alert to Slack."""
+        return self._send(f":fire: *Email Monitor CRASHED*\n{detail}")
 
     # ── Public: immediate alert ───────────────────────────────────────────────
 

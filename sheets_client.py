@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -77,66 +77,9 @@ def _get_oauth_credentials() -> OAuthCredentials:
     return creds
 
 TAB_WORKSPACES  = "Workspaces"
-TAB_ACCOUNTS    = "Accounts"
 TAB_ALERT_STATE = "alert_state"   # created automatically on first run (lowercase is fine)
 
 _AS_COLS = ["email", "workspace_name", "first_detected", "last_alerted", "reconnect_attempts", "status"]
-
-# Hosts that identify Mission Inbox accounts (auto-reconnectable via SMTP/IMAP)
-MISSIONINBOX_IMAP_DOMAINS: Set[str] = {"outboxment.com", "inboxment.com"}
-
-# Map actual sheet column names → normalized internal field names
-_ACCOUNT_COLUMN_MAP: Dict[str, str] = {
-    "email":         "email",           # handle both title-case and lower variants
-    "Email":         "email",
-    "First Name":    "first_name",
-    "Last Name":     "last_name",
-    "IMAP Username": "imap_user",
-    "IMAP Password": "imap_password",
-    "IMAP Host":     "imap_host",
-    "IMAP Port":     "imap_port",
-    "SMTP Username": "smtp_user",
-    "SMTP Password": "smtp_password",
-    "SMTP Host":     "smtp_host",
-    "SMTP Port":     "smtp_port",
-}
-
-
-def _detect_provider(imap_host: str) -> str:
-    """Infer provider from IMAP hostname. Returns 'missioninbox' or 'unknown'."""
-    host = (imap_host or "").lower()
-    for domain in MISSIONINBOX_IMAP_DOMAINS:
-        if domain in host:
-            return "missioninbox"
-    return "unknown"
-
-
-def _normalise_account_row(raw: Dict) -> Dict:
-    """
-    Convert a raw gspread row (using actual sheet column names) to the
-    normalised field names used throughout the rest of the codebase.
-    Provider is auto-detected from IMAP Host.
-    """
-    out: Dict = {}
-    for sheet_col, internal_key in _ACCOUNT_COLUMN_MAP.items():
-        if sheet_col in raw:
-            out[internal_key] = raw[sheet_col]
-
-    # Ensure email is lowercase
-    out["email"] = str(out.get("email", "")).strip().lower()
-
-    # Auto-detect provider
-    out["provider"] = _detect_provider(str(out.get("imap_host", "")))
-
-    # Coerce ports to int
-    for port_field in ("imap_port", "smtp_port"):
-        try:
-            out[port_field] = int(out.get(port_field) or 0) or None
-        except (ValueError, TypeError):
-            out[port_field] = None
-
-    return out
-
 
 class SheetsClient:
     def __init__(self, credentials_dict: dict, sheet_id: str):
@@ -213,21 +156,6 @@ class SheetsClient:
         logger.debug("Loaded %d active workspace(s) from Sheets.", len(result))
         return result
 
-    def get_accounts(self) -> List[Dict]:
-        """
-        Return Mission Inbox accounts from the 'accounts' tab, normalised to
-        internal field names. Provider is auto-detected from IMAP Host.
-        """
-        ws = self._worksheet(TAB_ACCOUNTS)
-        raw_rows = ws.get_all_records()  # uses first row as headers automatically
-        result = []
-        for raw in raw_rows:
-            norm = _normalise_account_row(raw)
-            if norm.get("email"):
-                result.append(norm)
-        logger.debug("Loaded %d account credential row(s) from Sheets.", len(result))
-        return result
-
     def get_alert_state(self) -> Dict[str, Dict]:
         """
         Return current alert_state as a dict keyed by email (lowercase).
@@ -252,20 +180,28 @@ class SheetsClient:
 
     # ── Public write methods ──────────────────────────────────────────────────
 
-    def _get_alert_state_worksheet_with_index(self) -> tuple[gspread.Worksheet, Dict[str, int]]:
-        """Return (worksheet, {email: row_number}) — row 1 is header."""
+    # ── Cached alert_state index (avoids repeated Google Sheets API calls) ────
+
+    _as_ws: Optional[gspread.Worksheet] = None
+    _as_index: Optional[Dict[str, int]] = None
+
+    def _ensure_alert_state_index(self) -> tuple[gspread.Worksheet, Dict[str, int]]:
+        """Load the alert_state index once per run; subsequent calls use cache."""
+        if self._as_ws is not None and self._as_index is not None:
+            return self._as_ws, self._as_index
         ws = self._worksheet(TAB_ALERT_STATE)
         if not ws.row_values(1):
             ws.append_row(_AS_COLS)
         all_emails = ws.col_values(1)[1:]  # skip header
-        index = {e.strip().lower(): i + 2 for i, e in enumerate(all_emails) if e.strip()}
-        return ws, index
+        self._as_ws = ws
+        self._as_index = {e.strip().lower(): i + 2 for i, e in enumerate(all_emails) if e.strip()}
+        return self._as_ws, self._as_index
 
     def upsert_alert_state(self, email: str, workspace_name: str,
                            first_detected: str, last_alerted: str,
                            reconnect_attempts: int, status: str) -> None:
         """Insert or update a row in alert_state for the given email."""
-        ws, index = self._get_alert_state_worksheet_with_index()
+        ws, index = self._ensure_alert_state_index()
         row_data = [
             email.lower(), workspace_name, first_detected, last_alerted,
             reconnect_attempts, status,
@@ -277,15 +213,22 @@ class SheetsClient:
             logger.debug("Updated alert_state row %d for %s", row_num, email)
         else:
             ws.append_row(row_data)
+            # Update cache: new row is at end (after all existing + header)
+            index[key] = len(index) + 2
             logger.debug("Appended alert_state row for %s", email)
 
     def delete_alert_state(self, email: str) -> None:
         """Remove a row from alert_state (account came back online)."""
-        ws, index = self._get_alert_state_worksheet_with_index()
+        ws, index = self._ensure_alert_state_index()
         key = email.lower()
         if key not in index:
             return
         row_num = index[key]
         ws.delete_rows(row_num)
+        # Update cache: remove this key and shift all rows below it up by 1
+        del index[key]
+        for k, v in index.items():
+            if v > row_num:
+                index[k] = v - 1
         logger.debug("Deleted alert_state row %d for %s (account recovered)", row_num, email)
 
