@@ -36,10 +36,17 @@ class MissionInboxAPIError(Exception):
 
 
 class MissionInboxClient:
+    # Workspace-level billing status detected from API responses.
+    workspace_billing_status: Optional[str] = None
+
+    _PAYMENT_KEYWORDS = ("payment pending", "payment overdue", "suspended", "insufficient funds",
+                         "subscription expired", "billing", "overdue", "account disabled")
+
     def __init__(self, api_key: str, base_url: str = _DEFAULT_BASE_URL):
         self._api_key = api_key
         self._base_url = (base_url or _DEFAULT_BASE_URL).rstrip("/")
         self._session = requests.Session()
+        self.workspace_billing_status = None
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -86,11 +93,14 @@ class MissionInboxClient:
         raise MissionInboxAPIError(0, "Max retries exceeded") from last_exc
 
     def list_mailboxes(self) -> List[Dict]:
-        """Return all mailboxes in this workspace (auto-paginates)."""
+        """Return all mailboxes in this workspace (auto-paginates).
+        Also checks for workspace-level billing/payment issues."""
         all_mailboxes: List[Dict] = []
         page = 1
         while True:
             result = self._request("GET", f"/api/mailboxes?page={page}&limit=100")
+            # Check for billing indicators in the response
+            self._detect_billing_status(result)
             data = result.get("data", [])
             all_mailboxes.extend(data)
             if page >= result.get("totalPages", 1):
@@ -98,6 +108,27 @@ class MissionInboxClient:
             page += 1
         logger.info("MissionInbox: loaded %d mailbox(es) (workspace key: ...%s)", len(all_mailboxes), self._api_key[-6:])
         return all_mailboxes
+
+    def _detect_billing_status(self, response: dict) -> None:
+        """Check API response for billing/payment issues at workspace level."""
+        if not isinstance(response, dict):
+            return
+        for field in ("message", "status", "billingStatus", "billing_status",
+                      "subscriptionStatus", "subscription_status", "warning", "error"):
+            val = str(response.get(field, "")).lower()
+            if any(kw in val for kw in self._PAYMENT_KEYWORDS):
+                self.workspace_billing_status = str(response.get(field, ""))
+                logger.warning(
+                    "MissionInbox: workspace billing issue detected: %s",
+                    self.workspace_billing_status,
+                )
+                return
+
+    @staticmethod
+    def is_mailbox_suspended(mailbox: Dict) -> bool:
+        """Check if a mailbox's status indicates suspension or payment issues."""
+        status = str(mailbox.get("status", "")).lower()
+        return status in ("suspended", "payment_pending", "inactive", "disabled")
 
     def get_credentials(self, email: str) -> Optional[Dict]:
         """

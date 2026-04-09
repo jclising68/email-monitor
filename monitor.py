@@ -160,6 +160,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         # Build a Mission Inbox client for this workspace if it has an API key configured
         missioninbox_client: Optional[MissionInboxClient] = None
         missioninbox_email_set: set = set()
+        missioninbox_billing_issue: Optional[str] = None
         mi_api_key = ws.get("mission_inbox_api_key", "")
         if mi_api_key:
             missioninbox_client = MissionInboxClient(api_key=mi_api_key)
@@ -173,6 +174,13 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     "MissionInbox: workspace '%s' has %d mailbox(es).",
                     ws_name, len(missioninbox_email_set),
                 )
+                # Check for billing issues
+                if missioninbox_client.workspace_billing_status:
+                    missioninbox_billing_issue = missioninbox_client.workspace_billing_status
+                    logger.warning(
+                        "MissionInbox billing issue for workspace '%s': %s",
+                        ws_name, missioninbox_billing_issue,
+                    )
             except Exception as exc:
                 logger.error(
                     "MissionInbox: failed to list mailboxes for workspace '%s' (%s) — "
@@ -274,6 +282,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                 if provider == "missioninbox":
                     _handle_missioninbox_disconnect(
                         email, ws_name, client, sheets, slack, missioninbox_client,
+                        missioninbox_billing_issue,
                         alert_state, report, _cfg,
                     )
                 elif provider == "zapmail":
@@ -582,6 +591,7 @@ def _handle_missioninbox_disconnect(
     sheets: SheetsClient,
     slack: "SlackReporter",
     missioninbox_client: Optional["MissionInboxClient"],
+    billing_issue: Optional[str],
     alert_state: Dict,
     report: ReportData,
     cfg: Config,
@@ -589,6 +599,29 @@ def _handle_missioninbox_disconnect(
     """Attempt auto-reconnect for a disconnected Mission Inbox account."""
     existing_row    = alert_state.get(email)
     current_attempts = int((existing_row or {}).get("reconnect_attempts", 0))
+
+    # ── Billing issue — skip reconnect, report payment problem ─────────────
+    if billing_issue:
+        logger.warning(
+            "MissionInbox billing issue for %s (%s): %s — skipping reconnect.",
+            email, ws_name, billing_issue,
+        )
+        new_row = build_new_alert_state_row(email, ws_name)
+        if existing_row:
+            new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
+        new_row["status"] = "missioninbox_billing_issue"
+        new_row["reconnect_attempts"] = cfg.max_reconnect_attempts
+        try:
+            sheets.upsert_alert_state(**new_row)
+            alert_state[email] = new_row
+        except Exception as exc:
+            logger.error("Failed to write alert_state for MI billing %s: %s", email, exc)
+        report.still_disconnected.append({
+            "email": email, "workspace_name": ws_name,
+            "provider": "missioninbox", "attempts": 0,
+            "reason": f"Mission Inbox payment pending — {billing_issue}",
+        })
+        return
 
     # ── If last reconnect is pending confirmation, check if it failed ────
     if existing_row and existing_row.get("status") == "reconnect_pending":
