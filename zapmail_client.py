@@ -110,8 +110,44 @@ class ZapMailClient:
     # ── Mailbox methods ───────────────────────────────────────────────────────
 
     # Workspace-level billing status detected from API responses.
-    # Set by list_mailboxes() if the response contains billing indicators.
+    # Set by check_subscription_status() or list_mailboxes().
     workspace_billing_status: Optional[str] = None
+
+    def check_subscription_status(self) -> Optional[str]:
+        """
+        GET /v2/subscriptions — check if any subscription has payment issues.
+
+        Returns None if all subscriptions are healthy, or a descriptive string
+        if any subscription has PAYMENT_PENDING, PAUSED, or CANCELLED status.
+
+        ZapMail subscription statuses: ACTIVE, CANCELLED, PAUSED, PAYMENT_PENDING
+        """
+        try:
+            result = self._request("GET", "/v2/subscriptions")
+            subscriptions = []
+            if isinstance(result, dict):
+                subscriptions = result.get("data", [])
+            elif isinstance(result, list):
+                subscriptions = result
+
+            for sub in subscriptions:
+                status = str(sub.get("subscriptionStatus", "")).upper()
+                if status in ("PAYMENT_PENDING", "PAUSED", "CANCELLED"):
+                    failure_msg = sub.get("paymentFailureMessage") or ""
+                    plan = sub.get("plan", "")
+                    issue = f"Subscription {status}"
+                    if failure_msg:
+                        issue += f" — {failure_msg}"
+                    if plan:
+                        issue += f" (plan: {plan})"
+                    self.workspace_billing_status = issue
+                    logger.warning("ZapMail subscription issue: %s", issue)
+                    return issue
+
+            return None
+        except Exception as exc:
+            logger.warning("ZapMail: failed to check subscription status: %s (non-fatal)", exc)
+            return None
 
     def list_mailboxes(self) -> List[Dict]:
         """

@@ -146,16 +146,26 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     ws_name, len(zapmail_email_set),
                 )
 
-        # Detect ZapMail billing issues across all provider clients
+        # Detect ZapMail billing issues via subscription API + response inspection
         zapmail_billing_issue: Optional[str] = None
-        for zm_c in set(zapmail_email_to_client.values()):
-            if zm_c.workspace_billing_status:
+        _checked_zm_clients: set = set()
+        for zm_c in zapmail_email_to_client.values():
+            if id(zm_c) in _checked_zm_clients:
+                continue
+            _checked_zm_clients.add(id(zm_c))
+            # 1. Check subscription status via dedicated API endpoint
+            if not zapmail_billing_issue:
+                sub_issue = zm_c.check_subscription_status()
+                if sub_issue:
+                    zapmail_billing_issue = sub_issue
+            # 2. Also check if list_mailboxes response had billing indicators
+            if not zapmail_billing_issue and zm_c.workspace_billing_status:
                 zapmail_billing_issue = zm_c.workspace_billing_status
-                logger.warning(
-                    "ZapMail billing issue for workspace '%s': %s",
-                    ws_name, zapmail_billing_issue,
-                )
-                break
+        if zapmail_billing_issue:
+            logger.warning(
+                "ZapMail billing issue for workspace '%s': %s",
+                ws_name, zapmail_billing_issue,
+            )
 
         # Build a Mission Inbox client for this workspace if it has an API key configured
         missioninbox_client: Optional[MissionInboxClient] = None
