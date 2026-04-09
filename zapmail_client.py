@@ -109,13 +109,22 @@ class ZapMailClient:
 
     # ── Mailbox methods ───────────────────────────────────────────────────────
 
+    # Workspace-level billing status detected from API responses.
+    # Set by list_mailboxes() if the response contains billing indicators.
+    workspace_billing_status: Optional[str] = None
+
     def list_mailboxes(self) -> List[Dict]:
         """
         GET /v2/mailboxes/list — return all mailboxes in this workspace.
         Actual response: {status, message, data: {domains: [{domain, mailboxes: [...]}]}}
         Mailboxes are flattened across all domains.
+        Also checks for workspace-level billing/payment issues.
         """
         result = self._request("GET", "/v2/mailboxes/list")
+
+        # Check for workspace-level billing status in the response
+        self._detect_billing_status(result)
+
         if isinstance(result, list):
             return result
 
@@ -136,6 +145,44 @@ class ZapMailClient:
 
         logger.warning("ZapMail list_mailboxes: unexpected response shape: %s", list(result.keys()))
         return []
+
+    _PAYMENT_KEYWORDS = ("payment pending", "payment overdue", "suspended", "insufficient funds",
+                         "subscription expired", "billing", "overdue")
+
+    def _detect_billing_status(self, response: dict) -> None:
+        """Check API response for billing/payment issues at workspace level."""
+        if not isinstance(response, dict):
+            return
+        # Check common fields where ZapMail might surface billing info
+        for field in ("message", "status", "billingStatus", "billing_status",
+                      "subscriptionStatus", "subscription_status", "warning"):
+            val = str(response.get(field, "")).lower()
+            if any(kw in val for kw in self._PAYMENT_KEYWORDS):
+                self.workspace_billing_status = str(response.get(field, ""))
+                logger.warning(
+                    "ZapMail: workspace billing issue detected: %s",
+                    self.workspace_billing_status,
+                )
+                return
+        # Also check nested data
+        data = response.get("data", {})
+        if isinstance(data, dict):
+            for field in ("billingStatus", "billing_status", "subscriptionStatus",
+                          "subscription_status", "warning", "message"):
+                val = str(data.get(field, "")).lower()
+                if any(kw in val for kw in self._PAYMENT_KEYWORDS):
+                    self.workspace_billing_status = str(data.get(field, ""))
+                    logger.warning(
+                        "ZapMail: workspace billing issue detected: %s",
+                        self.workspace_billing_status,
+                    )
+                    return
+
+    @staticmethod
+    def is_mailbox_suspended(mailbox: Dict) -> bool:
+        """Check if a mailbox's status indicates suspension or payment issues."""
+        status = str(mailbox.get("status", "")).lower()
+        return status in ("suspended", "payment_pending", "inactive", "disabled")
 
     def find_mailbox_by_email(self, email: str) -> Optional[Dict]:
         """Search all mailboxes client-side (ZapMail has no dedicated search endpoint)."""
@@ -168,7 +215,9 @@ class ZapMailClient:
         return self._request("POST", "/v2/exports/mailboxes", json=payload)
 
     # Errors that mean "don't retry — needs manual fix in ZapMail"
-    _PERMANENT_ERRORS = ("invalid account credentials", "unauthorized", "forbidden")
+    _PERMANENT_ERRORS = ("invalid account credentials", "unauthorized", "forbidden",
+                         "payment pending", "payment overdue", "suspended",
+                         "subscription expired", "insufficient funds")
 
     def reconnect_email(self, email: str, cached_mailbox: Optional[Dict] = None) -> tuple:
         """

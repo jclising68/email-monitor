@@ -398,8 +398,12 @@ def _format_daily_report(r: ReportData) -> str:
         for item in r.still_disconnected:
             provider = item.get("provider", "unknown")
             attempts = item.get("attempts", 0)
+            reason = item.get("reason", "")
             label = {"zapmail": "ZapMail", "missioninbox": "Mission Inbox", "client": "Client account"}.get(provider, "")
-            if provider == "client":
+            if reason:
+                # Specific reason (e.g. payment pending) — show directly
+                note = reason
+            elif provider == "client":
                 note = "Client account — notify client to reconnect in Instantly"
             elif provider in ("zapmail", "missioninbox") and attempts == 0:
                 note = f"{label}, manual action required"

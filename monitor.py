@@ -146,6 +146,17 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     ws_name, len(zapmail_email_set),
                 )
 
+        # Detect ZapMail billing issues across all provider clients
+        zapmail_billing_issue: Optional[str] = None
+        for zm_c in set(zapmail_email_to_client.values()):
+            if zm_c.workspace_billing_status:
+                zapmail_billing_issue = zm_c.workspace_billing_status
+                logger.warning(
+                    "ZapMail billing issue for workspace '%s': %s",
+                    ws_name, zapmail_billing_issue,
+                )
+                break
+
         # Build a Mission Inbox client for this workspace if it has an API key configured
         missioninbox_client: Optional[MissionInboxClient] = None
         missioninbox_email_set: set = set()
@@ -270,6 +281,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                         email, ws_name,
                         zapmail_email_to_client.get(email),
                         zapmail_email_to_mailbox.get(email),
+                        zapmail_billing_issue,
                         sheets, slack, alert_state, report, _cfg,
                     )
                 else:
@@ -699,6 +711,7 @@ def _handle_zapmail_disconnect(
     ws_name: str,
     zapmail_client: Optional[ZapMailClient],
     cached_mailbox: Optional[Dict],
+    billing_issue: Optional[str],
     sheets: SheetsClient,
     slack: SlackReporter,
     alert_state: Dict,
@@ -708,10 +721,42 @@ def _handle_zapmail_disconnect(
     """
     Attempt ZapMail auto-reconnect via the ZapMail export API.
     Uses cached_mailbox from the initial list_mailboxes() call to avoid duplicate API calls.
+    Skips reconnect if billing_issue is detected (payment pending, subscription expired, etc.).
     Falls back to a one-time Slack alert if no client is configured or reconnect fails.
     """
     existing_row     = alert_state.get(email)
     current_attempts = int((existing_row or {}).get("reconnect_attempts", 0))
+
+    # ── Billing issue — skip reconnect, report payment problem ─────────────
+    # Check workspace-level billing OR individual mailbox suspension
+    mailbox_suspended = cached_mailbox and ZapMailClient.is_mailbox_suspended(cached_mailbox)
+    effective_billing_issue = billing_issue or (
+        f"Mailbox suspended (status: {cached_mailbox.get('status', '?')})"
+        if mailbox_suspended else None
+    )
+
+    if effective_billing_issue:
+        logger.warning(
+            "ZapMail billing issue for %s (%s): %s — skipping reconnect.",
+            email, ws_name, effective_billing_issue,
+        )
+        # Record in alert_state so we don't re-alert every run
+        new_row = build_new_alert_state_row(email, ws_name)
+        if existing_row:
+            new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
+        new_row["status"] = "zapmail_billing_issue"
+        new_row["reconnect_attempts"] = cfg.max_reconnect_attempts  # skip all retries
+        try:
+            sheets.upsert_alert_state(**new_row)
+            alert_state[email] = new_row
+        except Exception as exc:
+            logger.error("Failed to write alert_state for billing %s: %s", email, exc)
+        report.still_disconnected.append({
+            "email": email, "workspace_name": ws_name,
+            "provider": "zapmail", "attempts": 0,
+            "reason": f"ZapMail payment pending — {effective_billing_issue}",
+        })
+        return
 
     # ── If last reconnect is pending confirmation, check if it failed ────────
     if existing_row and existing_row.get("status") == "reconnect_pending":
