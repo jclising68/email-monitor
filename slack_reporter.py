@@ -144,7 +144,7 @@ class SlackReporter:
         return self._send("\n".join(lines))
 
     def send_reconnect_attempting(self, email: str, workspace_name: str, provider: str) -> bool:
-        """Alert: reconnect attempt starting."""
+        """Alert: single reconnect attempt starting."""
         text = (
             f":arrows_counterclockwise: *Attempting to reconnect account*\n"
             f"*Account:* {email}\n"
@@ -153,6 +153,25 @@ class SlackReporter:
             f"*Time:* {_now_pht()}"
         )
         return self._send(text)
+
+    def send_reconnect_attempting_batch(self, accounts: list, workspace_name: str) -> bool:
+        """Batched alert: multiple reconnect attempts starting in one workspace."""
+        if not accounts:
+            return True
+        if len(accounts) == 1:
+            a = accounts[0]
+            return self.send_reconnect_attempting(a["email"], workspace_name, a.get("provider", "ZapMail"))
+        lines = [
+            f":arrows_counterclockwise: *Attempting to reconnect {len(accounts)} accounts*",
+            f"*Workspace:* {workspace_name}",
+            f"*Time:* {_now_pht()}",
+            "",
+        ]
+        for a in accounts:
+            prov = a.get("provider", "")
+            prov_tag = f" _({prov})_" if prov else ""
+            lines.append(f"• {a['email']}{prov_tag}")
+        return self._send("\n".join(lines))
 
     def send_reconnect_success(self, email: str, workspace_name: str, provider: str) -> bool:
         """Alert: reconnect succeeded."""
@@ -259,6 +278,9 @@ class ReportData:
 
         # Successful auto-reconnects this run
         self.reconnected: List[Dict] = []        # [{email, workspace_name}]
+
+        # First-attempt reconnects this run (for batched Slack alert)
+        self.reconnect_attempted: List[Dict] = [] # [{email, workspace_name, provider}]
 
         # Still disconnected after all attempts
         self.still_disconnected: List[Dict] = [] # [{email, workspace_name, provider, attempts}]

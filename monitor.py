@@ -91,16 +91,14 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         # if empty but Google key exists, reuses Google key for Microsoft too.
         zapmail_email_set: set = set()
         zapmail_email_to_client: Dict[str, ZapMailClient] = {}
+        zapmail_email_to_mailbox: Dict[str, Dict] = {}  # cached mailbox data (incl. IDs)
 
         zm_key_google = ws.get("zapmail_workspace_key_google", "")
         zm_key_microsoft = ws.get("zapmail_workspace_key_microsoft", "")
 
-        # Build provider → workspace key mapping.
-        # Microsoft reuses Google key if its own column is empty.
         _zm_provider_keys: Dict[str, str] = {}
         if zm_key_google:
             _zm_provider_keys["GOOGLE"] = zm_key_google
-            # Automatically try Microsoft with same key (ZapMail uses same workspace key)
             _zm_provider_keys["MICROSOFT"] = zm_key_microsoft or zm_key_google
 
         if zapmail_api_key:
@@ -124,13 +122,12 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                         if mb_email and mb_email not in zapmail_email_set:
                             zapmail_email_set.add(mb_email)
                             zapmail_email_to_client[mb_email] = zm_client
+                            zapmail_email_to_mailbox[mb_email] = mb  # cache full mailbox object
                     logger.info(
                         "ZapMail [%s]: workspace '%s' has %d mailbox(es).",
                         provider, ws_name, len(zm_mailboxes),
                     )
                 except Exception as exc:
-                    # Microsoft may not exist for all workspaces — only log as
-                    # error if it was explicitly configured in the sheet.
                     if provider == "MICROSOFT" and not zm_key_microsoft:
                         logger.debug(
                             "ZapMail [MICROSOFT]: no Microsoft mailboxes for '%s' (expected).",
@@ -144,13 +141,9 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                         )
 
             if zapmail_email_set:
-                active_providers = [p for p in _zm_provider_keys if p in
-                    {zapmail_email_to_client[e]._service_provider for e in zapmail_email_set
-                     if e in zapmail_email_to_client}]
                 logger.info(
-                    "ZapMail: workspace '%s' total %d unique mailbox(es) across %s.",
+                    "ZapMail: workspace '%s' total %d unique mailbox(es).",
                     ws_name, len(zapmail_email_set),
-                    ", ".join(active_providers) if active_providers else "GOOGLE",
                 )
 
         # Build a Mission Inbox client for this workspace if it has an API key configured
@@ -276,6 +269,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     _handle_zapmail_disconnect(
                         email, ws_name,
                         zapmail_email_to_client.get(email),
+                        zapmail_email_to_mailbox.get(email),
                         sheets, slack, alert_state, report, _cfg,
                     )
                 else:
@@ -299,6 +293,14 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                         "email": email, "workspace_name": ws_name,
                         "provider": "client", "attempts": 0,
                     })
+
+        # ── Send batched reconnect alert (one message for all first-attempts) ──
+        first_attempt_emails = [
+            e for e in report.reconnect_attempted
+            if e.get("workspace_name") == ws_name
+        ]
+        if first_attempt_emails:
+            slack.send_reconnect_attempting_batch(first_attempt_emails, ws_name)
 
         # ── Warmup health (extracted from account data, no extra API call) ─
         if connected_accounts:
@@ -646,7 +648,9 @@ def _handle_missioninbox_disconnect(
         email, ws_name, current_attempts + 1,
     )
     if current_attempts == 0:
-        slack.send_reconnect_attempting(email, ws_name, "Mission Inbox")
+        report.reconnect_attempted.append({
+            "email": email, "workspace_name": ws_name, "provider": "Mission Inbox",
+        })
 
     if is_partial:
         success = attempt_post_only(client, email, creds)
@@ -694,6 +698,7 @@ def _handle_zapmail_disconnect(
     email: str,
     ws_name: str,
     zapmail_client: Optional[ZapMailClient],
+    cached_mailbox: Optional[Dict],
     sheets: SheetsClient,
     slack: SlackReporter,
     alert_state: Dict,
@@ -702,6 +707,7 @@ def _handle_zapmail_disconnect(
 ) -> None:
     """
     Attempt ZapMail auto-reconnect via the ZapMail export API.
+    Uses cached_mailbox from the initial list_mailboxes() call to avoid duplicate API calls.
     Falls back to a one-time Slack alert if no client is configured or reconnect fails.
     """
     existing_row     = alert_state.get(email)
@@ -709,8 +715,6 @@ def _handle_zapmail_disconnect(
 
     # ── If last reconnect is pending confirmation, check if it failed ────────
     if existing_row and existing_row.get("status") == "reconnect_pending":
-        # Account is STILL disconnected after last run's "successful" reconnect.
-        # The reconnect didn't actually work. Count it as a failed attempt.
         new_attempts = current_attempts + 1
         logger.warning(
             "ZapMail reconnect for %s (%s) did not hold — still disconnected. "
@@ -735,12 +739,17 @@ def _handle_zapmail_disconnect(
             "Attempting ZapMail reconnect for %s (%s), attempt #%d",
             email, ws_name, current_attempts + 1,
         )
+        # Track first-attempt for batched Slack alert (sent after all accounts processed)
         if current_attempts == 0:
-            slack.send_reconnect_attempting(email, ws_name, "ZapMail")
-        success, permanent_failure = zapmail_client.reconnect_email(email)
+            report.reconnect_attempted.append({
+                "email": email, "workspace_name": ws_name, "provider": "ZapMail",
+            })
+        # Use cached mailbox to avoid re-fetching list_mailboxes() for each email
+        success, permanent_failure = zapmail_client.reconnect_email(
+            email, cached_mailbox=cached_mailbox
+        )
 
         if success:
-            # Don't celebrate yet — mark as pending and verify on NEXT run.
             logger.info(
                 "ZapMail export succeeded for %s (%s) — will verify on next run.",
                 email, ws_name,
@@ -754,12 +763,9 @@ def _handle_zapmail_disconnect(
                 alert_state[email] = new_row
             except Exception as exc:
                 logger.error("Failed to write alert_state for ZapMail pending %s: %s", email, exc)
-            return  # wait for next run to confirm
+            return
 
-        # Reconnect failed
         if permanent_failure:
-            # Permanent error (e.g. invalid credentials) — skip to max so we don't
-            # waste 5 retries on something that needs manual ZapMail fix.
             new_attempts = cfg.max_reconnect_attempts
             logger.warning(
                 "ZapMail permanent failure for %s (%s) — skipping to max attempts. "

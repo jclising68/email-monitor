@@ -170,23 +170,31 @@ class ZapMailClient:
     # Errors that mean "don't retry — needs manual fix in ZapMail"
     _PERMANENT_ERRORS = ("invalid account credentials", "unauthorized", "forbidden")
 
-    def reconnect_email(self, email: str) -> tuple:
+    def reconnect_email(self, email: str, cached_mailbox: Optional[Dict] = None) -> tuple:
         """
         Find the mailbox in ZapMail by email, then re-export it to Instantly.
+
+        Args:
+            email: The email address to reconnect
+            cached_mailbox: Pre-fetched mailbox object from list_mailboxes().
+                If provided, skips the duplicate list_mailboxes() API call.
 
         Returns (success: bool, permanent_failure: bool)
           - (True, False)  = export API succeeded
           - (False, True)  = permanent error, don't retry (e.g. invalid credentials)
           - (False, False)  = transient error, retry might help
         """
-        try:
-            mailbox = self.find_mailbox_by_email(email)
-        except ZapMailAPIError as exc:
-            logger.error("ZapMail: failed to list mailboxes for %s: %s", email, exc)
-            return False, False
-        except Exception as exc:
-            logger.error("ZapMail: unexpected error listing mailboxes for %s: %s", email, exc)
-            return False, False
+        mailbox = cached_mailbox
+        if not mailbox:
+            # Fallback: fetch fresh if no cached data (should be rare)
+            try:
+                mailbox = self.find_mailbox_by_email(email)
+            except ZapMailAPIError as exc:
+                logger.error("ZapMail: failed to list mailboxes for %s: %s", email, exc)
+                return False, False
+            except Exception as exc:
+                logger.error("ZapMail: unexpected error listing mailboxes for %s: %s", email, exc)
+                return False, False
 
         if not mailbox:
             logger.warning(
@@ -211,8 +219,11 @@ class ZapMailClient:
             return False, True
 
         try:
-            self.export_mailboxes(mailbox_ids=[str(mailbox_id)])
-            logger.info("ZapMail: successfully re-exported %s to Instantly.", email)
+            result = self.export_mailboxes(mailbox_ids=[str(mailbox_id)])
+            logger.info(
+                "ZapMail: re-exported %s to Instantly (mailbox_id=%s, response=%s).",
+                email, mailbox_id, result,
+            )
             return True, False
         except ZapMailAPIError as exc:
             is_permanent = any(pe in str(exc).lower() for pe in self._PERMANENT_ERRORS)
