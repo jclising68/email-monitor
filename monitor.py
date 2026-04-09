@@ -633,6 +633,14 @@ def _handle_missioninbox_disconnect(
         })
         return
 
+    # ── Billing resolved — reset attempts so reconnect can retry ───────────
+    if existing_row and existing_row.get("status") == "missioninbox_billing_issue":
+        logger.info(
+            "MissionInbox billing resolved for %s (%s) — resetting reconnect attempts.",
+            email, ws_name,
+        )
+        current_attempts = 0
+
     # ── If last reconnect is pending confirmation, check if it failed ────
     if existing_row and existing_row.get("status") == "reconnect_pending":
         new_attempts = current_attempts + 1
@@ -771,7 +779,6 @@ def _handle_zapmail_disconnect(
     current_attempts = int((existing_row or {}).get("reconnect_attempts", 0))
 
     # ── Billing issue — skip reconnect, report payment problem ─────────────
-    # Check workspace-level billing OR individual mailbox suspension
     mailbox_suspended = cached_mailbox and ZapMailClient.is_mailbox_suspended(cached_mailbox)
     effective_billing_issue = billing_issue or (
         f"Mailbox suspended (status: {cached_mailbox.get('status', '?')})"
@@ -783,12 +790,11 @@ def _handle_zapmail_disconnect(
             "ZapMail billing issue for %s (%s): %s — skipping reconnect.",
             email, ws_name, effective_billing_issue,
         )
-        # Record in alert_state so we don't re-alert every run
         new_row = build_new_alert_state_row(email, ws_name)
         if existing_row:
             new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
         new_row["status"] = "zapmail_billing_issue"
-        new_row["reconnect_attempts"] = cfg.max_reconnect_attempts  # skip all retries
+        new_row["reconnect_attempts"] = cfg.max_reconnect_attempts
         try:
             sheets.upsert_alert_state(**new_row)
             alert_state[email] = new_row
@@ -800,6 +806,14 @@ def _handle_zapmail_disconnect(
             "reason": f"ZapMail payment pending — {effective_billing_issue}",
         })
         return
+
+    # ── Billing resolved — reset attempts so reconnect can retry ───────────
+    if existing_row and existing_row.get("status") == "zapmail_billing_issue":
+        logger.info(
+            "ZapMail billing resolved for %s (%s) — resetting reconnect attempts.",
+            email, ws_name,
+        )
+        current_attempts = 0
 
     # ── If last reconnect is pending confirmation, check if it failed ────────
     if existing_row and existing_row.get("status") == "reconnect_pending":
