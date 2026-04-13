@@ -538,7 +538,7 @@ def _format_weekly_domain_report(r: ReportData) -> str:
     lines.append(":white_check_mark: *All Domains*")
     for d in sorted_domains:
         emoji = ":red_circle:" if d.get("avg_health", 100) < 60 else (
-            ":large_orange_circle:" if d.get("avg_health", 100) < 85 else ":green_circle:"
+            ":large_orange_circle:" if d.get("avg_health", 100) < 85 else ":large_green_circle:"
         )
         dns_tag = ""
         dns_status = d.get("dns_status", [])
