@@ -247,8 +247,16 @@ class InstantlyClient:
         get_all_accounts(). No extra API call needed.
 
         Each account has `stat_warmup_score` (0-100) in the response from
-        GET /accounts. Returns {email: {"health_score": int}} for all
-        connected accounts that have a warmup score.
+        GET /accounts. Returns:
+          {email: {
+              "health_score": int,
+              "timestamp_created": str | None,  # ISO8601 from Instantly
+              "warmup_status": int | None,      # 1 = warming up
+          }}
+        for all connected accounts that have a warmup score.
+
+        timestamp_created is included so callers can grant a grace period
+        to brand-new accounts that legitimately start at 0% before ramp-up.
         """
         result: Dict[str, Dict] = {}
         for account in accounts:
@@ -256,11 +264,16 @@ class InstantlyClient:
             if not email:
                 continue
             score = account.get("stat_warmup_score")
-            if score is not None:
-                try:
-                    result[email] = {"health_score": int(score)}
-                except (ValueError, TypeError):
-                    pass
+            if score is None:
+                continue
+            try:
+                result[email] = {
+                    "health_score": int(score),
+                    "timestamp_created": account.get("timestamp_created"),
+                    "warmup_status": account.get("warmup_status"),
+                }
+            except (ValueError, TypeError):
+                pass
         return result
 
     # ── Campaign analytics ─────────────────────────────────────────────────────
@@ -276,14 +289,18 @@ class InstantlyClient:
         Returns list of campaign dicts with:
           - campaign_name, campaign_id, campaign_status
           - emails_sent_count, bounced_count, reply_count, open_count
+          - leads_count, contacted_count
           - unsubscribed_count, link_click_count
+
+        Note: we deliberately do NOT pass exclude_total_leads_count so
+        leads_count comes back populated — otherwise the daily report
+        shows "Leads: X/0" which is meaningless.
         """
         params: Dict = {}
         if start_date:
             params["start_date"] = start_date
         if end_date:
             params["end_date"] = end_date
-        params["exclude_total_leads_count"] = "true"  # must be lowercase string for API
 
         try:
             result = self._request("GET", "/campaigns/analytics", params=params)

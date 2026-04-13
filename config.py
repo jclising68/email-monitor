@@ -80,6 +80,13 @@ class Config:
         self.health_score_critical_threshold: int = int(
             get_env("HEALTH_SCORE_CRITICAL_THRESHOLD", required=False, default="60")
         )
+        # Grace period (days) after account creation before we treat a low
+        # health score as "critical" and auto-pause. New accounts start at
+        # stat_warmup_score=0 and legitimately ramp up over ~5-7 days — we
+        # must NOT pause them during this window or warmup breaks.
+        self.health_score_grace_days: int = int(
+            get_env("HEALTH_SCORE_GRACE_DAYS", required=False, default="7")
+        )
 
         # Spam rate threshold (percentage, 0-100). Alert if 7-day spam rate exceeds this.
         self.spam_rate_alert_threshold: int = int(
@@ -89,6 +96,15 @@ class Config:
         # Campaign bounce rate threshold (percentage). Alert if bounced/sent exceeds this.
         self.bounce_rate_alert_threshold: int = int(
             get_env("BOUNCE_RATE_ALERT_THRESHOLD", required=False, default="5")
+        )
+        # Bounce % at which a campaign is auto-paused (must be >= alert threshold).
+        self.campaign_bounce_pause_threshold: int = int(
+            get_env("CAMPAIGN_BOUNCE_PAUSE_THRESHOLD", required=False, default="10")
+        )
+        # Minimum emails_sent before a campaign's bounce rate is judged —
+        # smaller samples give meaningless percentages.
+        self.campaign_min_sent_for_bounce_check: int = int(
+            get_env("CAMPAIGN_MIN_SENT_FOR_BOUNCE_CHECK", required=False, default="50")
         )
 
     def configure_logging(self):

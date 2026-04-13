@@ -420,13 +420,30 @@ def _format_daily_report(r: ReportData) -> str:
     lines.append("")
     if r.health_alerts:
         lines.append(":thermometer: *Warmup Health Alerts*")
-        for item in sorted(r.health_alerts, key=lambda x: x.get("health_score", 100)):
+        # Sort: mature critical first (worst actual problems), then new/warming up, then warnings
+        def _sort_key(x):
+            score = x.get("health_score", 100)
+            is_new = bool(x.get("is_new_account"))
+            # mature low-health first, then warnings, then new accounts last
+            return (is_new, score)
+
+        for item in sorted(r.health_alerts, key=_sort_key):
             score = item.get("health_score", "?")
-            emoji = ":red_circle:" if score != "?" and score < 60 else ":large_orange_circle:"
+            is_new = bool(item.get("is_new_account"))
+            age_days = item.get("age_days")
+            if is_new:
+                emoji = ":seedling:"  # new account warming up — not a crisis
+            elif score != "?" and score < 60:
+                emoji = ":red_circle:"
+            else:
+                emoji = ":large_orange_circle:"
+            age_tag = ""
+            if age_days is not None:
+                age_tag = f" _(age {age_days:.1f}d)_"
             action_taken = item.get("action_taken", "")
             lines.append(
                 f"• {emoji} {item['email']} ({item['workspace_name']}) — "
-                f"Health: {score}%\n"
+                f"Health: {score}%{age_tag}\n"
                 f"   :point_right: _{action_taken}_"
             )
     else:
@@ -446,14 +463,29 @@ def _format_daily_report(r: ReportData) -> str:
         lines.append(":boom: *Campaign Bounce Alerts*")
         for item in sorted(r.bounce_alerts, key=lambda x: x.get("bounce_rate", 0), reverse=True):
             bounce_rate = item.get("bounce_rate", 0)
-            sev_emoji = ":red_circle:" if bounce_rate >= 10 else ":warning:"
+            # Severity: pause-worthy bounces get the red dot; the rest a warning.
+            sev_emoji = ":red_circle:" if "Auto-paused" in item.get("action_taken", "") else ":warning:"
             reply_rate = item.get("reply_rate", 0)
+            open_rate = item.get("open_rate", 0)
             action_taken = item.get("action_taken", "")
+            total_leads = item.get("total_leads", 0)
+            contacted = item.get("contacted", 0)
+            # Only render leads progress when we actually have the total
+            # (avoids the old "252/0" display when leads_count was excluded)
+            if total_leads > 0:
+                leads_tag = f" | Leads contacted: {contacted}/{total_leads}"
+            elif contacted > 0:
+                leads_tag = f" | Leads contacted: {contacted}"
+            else:
+                leads_tag = ""
+            unsub = item.get("unsubscribed", 0)
+            unsub_tag = f" | Unsubscribed: {unsub}" if unsub else ""
             lines.append(
                 f"• {sev_emoji} *{item['campaign_name']}* ({item['workspace_name']})\n"
                 f"   Bounce: {bounce_rate:.1f}% ({item['bounced']}/{item['sent']}) | "
-                f"Replies: {item.get('replies', 0)} ({reply_rate:.1f}%) | "
-                f"Leads: {item.get('contacted', 0)}/{item.get('total_leads', 0)}\n"
+                f"Opens: {item.get('opens', 0)} ({open_rate:.1f}%) | "
+                f"Replies: {item.get('replies', 0)} ({reply_rate:.1f}%)"
+                f"{leads_tag}{unsub_tag}\n"
                 f"   :point_right: _{action_taken}_"
             )
 

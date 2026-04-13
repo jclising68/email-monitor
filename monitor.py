@@ -427,6 +427,26 @@ def _resolve_provider(
     return "unknown"
 
 
+def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
+    """Parse an Instantly ISO8601 timestamp (may end in 'Z'). Returns tz-aware UTC or None."""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        # Instantly sends e.g. "2026-04-10T14:22:31.000Z" — fromisoformat handles
+        # it on Python 3.11+, but we normalise Z→+00:00 for older runtimes.
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _account_age_days(timestamp_created: Optional[str]) -> Optional[float]:
+    """Days since account was created in Instantly, or None if unknown."""
+    created = _parse_ts(timestamp_created)
+    if created is None:
+        return None
+    return (datetime.now(timezone.utc) - created).total_seconds() / 86400.0
+
+
 def _process_warmup_health(
     warmup_health: Dict,
     ws_name: str,
@@ -442,8 +462,16 @@ def _process_warmup_health(
     Fully isolated from the reconnect flow.
 
     Automated actions:
-      - Health < 60% (critical): auto-pauses the account in Instantly
-      - Health 60-80% (warning): alert only in daily report
+      - Health < critical_threshold AND account is older than the grace
+        period: auto-pauses the account in Instantly (pauses BOTH warmup
+        and campaign sending — Instantly status=2 is account-wide).
+      - Health < critical_threshold AND account is still within grace
+        period: alert only, flagged as "new account warming up".
+      - Health between critical and alert threshold: alert only.
+
+    The grace period protects brand-new accounts that legitimately start
+    at stat_warmup_score=0 before the warmup algorithm has any data.
+    Without it every newly-added account gets auto-paused on first run.
 
     All health issues are collected into report.health_alerts and
     report.domain_health — they surface in the daily/weekly report.
@@ -471,17 +499,50 @@ def _process_warmup_health(
         # ── Health below threshold — collect + auto-act ───────────────────
         if health_score < cfg.health_score_alert_threshold:
             is_critical = health_score < cfg.health_score_critical_threshold
+            age_days = _account_age_days(data.get("timestamp_created"))
+            is_new_account = (
+                age_days is not None and age_days < cfg.health_score_grace_days
+            )
+            age_unknown = age_days is None
             action_taken = ""
 
-            if is_critical:
-                # Auto-pause the account to protect domain reputation
+            if is_critical and is_new_account:
+                # Brand-new account still ramping up — DO NOT auto-pause.
+                # stat_warmup_score=0 is the expected starting state; pausing
+                # here would stop warmup from ever running and trash the
+                # account before it has a chance to warm up.
+                action_taken = (
+                    f"New account (age {age_days:.1f}d, grace {cfg.health_score_grace_days}d) "
+                    f"— skipping auto-pause while warmup ramps up"
+                )
+                logger.info(
+                    "Skipping auto-pause for %s (%s): score=%d%%, age=%.1fd (grace=%dd).",
+                    email, ws_name, health_score, age_days, cfg.health_score_grace_days,
+                )
+            elif is_critical and age_unknown:
+                # We cannot determine the account's age — be conservative
+                # and do NOT auto-pause. Better to alert and let a human
+                # decide than to nuke a ramping-up account.
+                action_taken = (
+                    "Critical health but account age unknown — "
+                    "review manually before pausing"
+                )
+                logger.warning(
+                    "Skipping auto-pause for %s (%s): score=%d%%, age=unknown.",
+                    email, ws_name, health_score,
+                )
+            elif is_critical:
+                # Mature account with critically low health — auto-pause.
+                # This pauses the account in Instantly entirely (status=2)
+                # which halts BOTH warmup sending AND use in campaigns.
                 try:
                     paused = client.pause_account(email)
                     if paused:
-                        action_taken = "Auto-paused in Instantly"
+                        action_taken = "Auto-paused in Instantly (halts warmup + campaign sending)"
                         logger.warning(
-                            "Auto-paused %s (%s) — health score %d%% is critical.",
+                            "Auto-paused %s (%s) — health score %d%% is critical, age %s.",
                             email, ws_name, health_score,
+                            f"{age_days:.1f}d" if age_days is not None else "unknown",
                         )
                     else:
                         action_taken = "Auto-pause failed — pause manually in Instantly"
@@ -499,6 +560,8 @@ def _process_warmup_health(
             report.health_alerts.append({
                 "email": email, "workspace_name": ws_name,
                 "health_score": health_score,
+                "age_days": age_days,
+                "is_new_account": is_new_account,
                 "action_taken": action_taken,
             })
 
@@ -530,42 +593,65 @@ def _process_campaign_health(
     Check campaign bounce rates. Fully isolated from reconnect flow.
     Only checks active campaigns (status=1) with meaningful send volume.
 
-    Automated actions:
-      - Bounce ≥ 10%: auto-pauses the campaign in Instantly
-      - Bounce 5-10%: alert only in daily report
+    All metrics are pulled live from GET /campaigns/analytics — nothing
+    is hardcoded or assumed. Thresholds come from config:
+      - bounce_rate_alert_threshold:  % at which to surface a warning
+      - campaign_bounce_pause_threshold: % at which to auto-pause
+      - campaign_min_sent_for_bounce_check: min sent to judge bounce %
     """
     for campaign in campaigns:
         status = campaign.get("campaign_status")
         if status != 1:  # only check active campaigns
             continue
 
+        # ── All fields from Instantly /campaigns/analytics (no hardcoding) ──
         name = campaign.get("campaign_name", "Unknown")
         campaign_id = campaign.get("campaign_id", "")
-        sent = campaign.get("emails_sent_count", 0)
-        bounced = campaign.get("bounced_count", 0)
-        contacted = campaign.get("contacted_count", 0)
-        total_leads = campaign.get("leads_count", 0)
-        replies = campaign.get("reply_count_unique", campaign.get("reply_count", 0))
+        sent = int(campaign.get("emails_sent_count") or 0)
+        bounced = int(campaign.get("bounced_count") or 0)
+        contacted = int(campaign.get("contacted_count") or 0)
+        total_leads = int(campaign.get("leads_count") or 0)
+        replies = int(
+            campaign.get("reply_count_unique")
+            or campaign.get("reply_count")
+            or 0
+        )
+        opens = int(
+            campaign.get("open_count_unique")
+            or campaign.get("open_count")
+            or 0
+        )
+        clicks = int(
+            campaign.get("link_click_count_unique")
+            or campaign.get("link_click_count")
+            or 0
+        )
+        unsubscribed = int(campaign.get("unsubscribed_count") or 0)
 
-        # Need meaningful volume — at least 50 emails sent to judge bounce rate
-        if sent < 50:
+        # Need meaningful volume — config-driven minimum to judge bounce rate.
+        if sent < cfg.campaign_min_sent_for_bounce_check:
             continue
 
         bounce_rate = (bounced / sent * 100) if sent > 0 else 0.0
 
         if bounce_rate >= cfg.bounce_rate_alert_threshold:
             reply_rate = (replies / sent * 100) if sent > 0 else 0.0
+            open_rate = (opens / sent * 100) if sent > 0 else 0.0
             action_taken = ""
 
-            # Auto-pause campaigns with bounce ≥ 10%
-            if bounce_rate >= 10 and campaign_id:
+            should_pause = (
+                bounce_rate >= cfg.campaign_bounce_pause_threshold
+                and bool(campaign_id)
+            )
+            if should_pause:
                 try:
                     paused = client.pause_campaign(campaign_id)
                     if paused:
                         action_taken = "Auto-paused campaign — re-verify lead list before resuming"
                         logger.warning(
-                            "Auto-paused campaign '%s' (%s) — bounce rate %.1f%% exceeds 10%%.",
+                            "Auto-paused campaign '%s' (%s) — bounce rate %.1f%% exceeds %d%%.",
                             name, ws_name, bounce_rate,
+                            cfg.campaign_bounce_pause_threshold,
                         )
                     else:
                         action_taken = "Auto-pause failed — pause manually in Instantly and re-verify lead list"
@@ -590,6 +676,10 @@ def _process_campaign_health(
                 "total_leads": total_leads,
                 "reply_rate": reply_rate,
                 "replies": replies,
+                "opens": opens,
+                "open_rate": open_rate,
+                "clicks": clicks,
+                "unsubscribed": unsubscribed,
                 "action_taken": action_taken,
             })
 
