@@ -47,6 +47,7 @@ jobs:
           HEALTH_SCORE_CRITICAL_THRESHOLD: '60'
           SPAM_RATE_ALERT_THRESHOLD: '10'
           BOUNCE_RATE_ALERT_THRESHOLD: '5'
+          DAILY_LIMIT_MAX:          '30'
           LOG_LEVEL:                'INFO'
         run: |
           SCHEDULE="${{ github.event.schedule }}"

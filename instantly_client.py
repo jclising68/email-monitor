@@ -344,6 +344,19 @@ class InstantlyClient:
             logger.error("Unexpected error pausing account %s: %s", email, exc)
             return False
 
+    def update_daily_limit(self, email: str, daily_limit: int) -> bool:
+        """Set the daily campaign sending limit for an account. Returns True on success."""
+        try:
+            self._request("PATCH", f"/accounts/{email}", json={"daily_limit": daily_limit})
+            logger.info("Set daily_limit=%d for account %s.", daily_limit, email)
+            return True
+        except InstantlyAPIError as exc:
+            logger.error("Failed to update daily_limit for %s: %s", email, exc)
+            return False
+        except Exception as exc:
+            logger.error("Unexpected error updating daily_limit for %s: %s", email, exc)
+            return False
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod

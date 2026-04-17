@@ -216,6 +216,34 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             if not email:
                 continue
 
+            # ── Daily campaign limit cap ──────────────────────────────────
+            # Any account with daily_limit above the configured cap gets
+            # auto-adjusted back down. Runs for every account regardless of
+            # status — a paused/disconnected account can still carry a high
+            # limit that applies when it resumes.
+            raw_limit = account.get("daily_limit")
+            if raw_limit is not None:
+                try:
+                    current_limit = int(raw_limit)
+                except (TypeError, ValueError):
+                    current_limit = None
+                if current_limit is not None and current_limit > _cfg.daily_limit_max:
+                    try:
+                        ok = client.update_daily_limit(email, _cfg.daily_limit_max)
+                    except Exception as exc:
+                        ok = False
+                        logger.error(
+                            "Error updating daily_limit for %s (%s): %s",
+                            email, ws_name, exc,
+                        )
+                    report.daily_limit_adjustments.append({
+                        "email": email,
+                        "workspace_name": ws_name,
+                        "previous_limit": current_limit,
+                        "new_limit": _cfg.daily_limit_max,
+                        "success": ok,
+                    })
+
             connected = client.is_connected(account)
             paused    = not connected and client.is_paused(account)
             in_warmup = connected and client.is_warming_up(account)
@@ -361,6 +389,14 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         logger.info(
             "Workspace %s: %d connected, %d warmup, %d paused, %d disconnected, %d DNS issues.",
             ws_name, summary.connected, summary.warmup, summary.paused, summary.disconnected, summary.dns_issues,
+        )
+
+    # ── Daily limit adjustments — immediate batched alert ────────────────────
+    # Only sends if we actually adjusted anything this run. Self-regulating:
+    # once an account is capped, next run sees it at the cap and stays silent.
+    if report.daily_limit_adjustments:
+        slack.send_daily_limit_adjusted_batch(
+            report.daily_limit_adjustments, _cfg.daily_limit_max,
         )
 
     # ── Daily report ──────────────────────────────────────────────────────────

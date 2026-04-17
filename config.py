@@ -107,6 +107,12 @@ class Config:
             get_env("CAMPAIGN_MIN_SENT_FOR_BOUNCE_CHECK", required=False, default="50")
         )
 
+        # Per-account daily sending cap. Any account found with daily_limit
+        # above this is auto-adjusted back down to this value.
+        self.daily_limit_max: int = int(
+            get_env("DAILY_LIMIT_MAX", required=False, default="30")
+        )
+
     def configure_logging(self):
         logging.basicConfig(
             level=getattr(logging, self.log_level, logging.INFO),

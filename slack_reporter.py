@@ -201,6 +201,36 @@ class SlackReporter:
         )
         return self._send(text)
 
+    # ── Public: daily limit adjustments ──────────────────────────────────────
+
+    def send_daily_limit_adjusted_batch(self, adjustments: list, max_limit: int) -> bool:
+        """
+        Immediate batched alert when one or more accounts had their daily_limit
+        auto-adjusted down this run. One message for the whole run (grouped by
+        workspace) so we never spam a message per account.
+        """
+        if not adjustments:
+            return True
+        lines = [
+            f":scales: *Daily Campaign Limit Adjusted* — cap is {max_limit}",
+            f"*Time:* {_now_pht()}",
+            "",
+        ]
+        by_ws: dict = defaultdict(list)
+        for a in adjustments:
+            by_ws[a["workspace_name"]].append(a)
+        for ws_name, items in sorted(by_ws.items()):
+            lines.append(f"*Workspace: {ws_name}*")
+            for item in sorted(items, key=lambda x: x["email"]):
+                prev = item.get("previous_limit")
+                new = item.get("new_limit")
+                ok = item.get("success", True)
+                tag = "" if ok else " :x: _(update failed — adjust manually in Instantly)_"
+                lines.append(f"  • {item['email']} — {prev} → {new}{tag}")
+        lines.append("")
+        lines.append(f":information_source: _Auto-adjusted to keep sending volume at or below {max_limit}/day._")
+        return self._send("\n".join(lines))
+
     # ── Public: health alerts ────────────────────────────────────────────────
 
     def send_health_alert(self, email: str, workspace_name: str,
@@ -306,6 +336,10 @@ class ReportData:
         # Campaign bounce rate alerts
         # [{campaign_name, workspace_name, bounce_rate, bounced, sent}]
         self.bounce_alerts: List[Dict] = []
+
+        # Accounts whose daily_limit was auto-adjusted down this run
+        # [{email, workspace_name, previous_limit, new_limit, success}]
+        self.daily_limit_adjustments: List[Dict] = []
 
     @property
     def total_workspaces(self) -> int:
@@ -488,6 +522,22 @@ def _format_daily_report(r: ReportData) -> str:
                 f"{leads_tag}{unsub_tag}\n"
                 f"   :point_right: _{action_taken}_"
             )
+
+    # ── Daily limit adjustments ──
+    if r.daily_limit_adjustments:
+        lines.append("")
+        lines.append(":scales: *Daily Campaign Limit Adjustments*")
+        by_ws_dl: dict = defaultdict(list)
+        for item in r.daily_limit_adjustments:
+            by_ws_dl[item["workspace_name"]].append(item)
+        for ws_name, items in sorted(by_ws_dl.items()):
+            lines.append(f"_{ws_name}_")
+            for item in sorted(items, key=lambda x: x["email"]):
+                prev = item.get("previous_limit")
+                new = item.get("new_limit")
+                ok = item.get("success", True)
+                tag = "" if ok else " :x: _(update failed)_"
+                lines.append(f"  • {item['email']} — {prev} → {new}{tag}")
 
     # ── DNS issues ──
     lines.append("")
