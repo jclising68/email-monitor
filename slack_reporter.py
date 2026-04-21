@@ -201,6 +201,109 @@ class SlackReporter:
         )
         return self._send(text)
 
+    # ── Public: provider-side errors (reconnect won't help) ─────────────────
+
+    # Presentation metadata per category — emoji, title, short cause, recovery hint.
+    # Adding a new category elsewhere? Append one row here and it flows through.
+    _PROVIDER_ERROR_META = {
+        "sending_limit_exceeded": {
+            "emoji": ":hourglass_flowing_sand:",
+            "title": "Daily Sending Limit Exceeded",
+            "cause": "Email provider (Gmail/Outlook) hit its per-mailbox 24-hour send cap. The account is still authenticated — this is a provider-side throttle, not a disconnection.",
+            "recovery": "Auto-recovers in ~24h when the provider's rolling counter resets. No reconnect will help. If this repeats, reduce `daily_limit` for this account in Instantly or lower `DAILY_LIMIT_MAX`.",
+        },
+        "suspicious_activity_blocked": {
+            "emoji": ":rotating_light:",
+            "title": "Suspicious Activity Blocked by Provider",
+            "cause": "Email provider flagged this mailbox for unusual sending. Reconnecting will NOT clear the flag.",
+            "recovery": "Sign in to the mailbox directly, review any security prompts, and pause the account until the provider lifts the block. Consider re-verifying the lead list.",
+        },
+        "mailbox_full": {
+            "emoji": ":inbox_tray:",
+            "title": "Mailbox Storage Full",
+            "cause": "Mailbox has exceeded its storage quota — sending is blocked until messages are cleared.",
+            "recovery": "Clear or expand mailbox storage. Reconnect is not the issue.",
+        },
+    }
+
+    def send_provider_error_alert(self, email: str, workspace_name: str,
+                                  category: str, detail: str,
+                                  response_code: Optional[int] = None) -> bool:
+        """
+        One-time (per 24h cooldown) alert for a provider-side error that
+        reconnect cannot fix. The category must be a key in _PROVIDER_ERROR_META;
+        unknown categories fall back to a generic heading.
+        """
+        meta = self._PROVIDER_ERROR_META.get(category, {
+            "emoji": ":warning:",
+            "title": category.replace("_", " ").title(),
+            "cause": "Provider-side error detected on the account.",
+            "recovery": "Investigate in Instantly — automatic reconnect was intentionally skipped.",
+        })
+        # Keep the raw SMTP text short so Slack renders cleanly.
+        detail_line = detail.strip().replace("\n", " ")
+        if len(detail_line) > 300:
+            detail_line = detail_line[:297] + "..."
+        code_tag = f" (SMTP {response_code})" if response_code else ""
+        text = (
+            f"{meta['emoji']} *{meta['title']}*{code_tag}\n"
+            f"*Account:* {email}\n"
+            f"*Workspace:* {workspace_name}\n"
+            f"*Detected:* {_now_pht()}\n"
+            f"*Cause:* {meta['cause']}\n"
+            f"*What we did:* Skipped auto-reconnect — it would not help here.\n"
+            f"*Recovery:* {meta['recovery']}\n"
+            f"*Provider error:* `{detail_line}`"
+        )
+        ok = self._send(text)
+        if ok:
+            logger.info(
+                "Slack provider-error alert sent for %s (%s): category=%s",
+                email, workspace_name, category,
+            )
+        return ok
+
+    def send_provider_error_batch(self, entries: list) -> bool:
+        """
+        Batched version — one Slack message grouping every provider-side
+        error hit this run. Use when many accounts in the same workspace
+        hit the same limit simultaneously (common with Gmail daily caps).
+
+        entries: list of dicts {email, workspace_name, category, detail, response_code}
+        """
+        if not entries:
+            return True
+        if len(entries) == 1:
+            e = entries[0]
+            return self.send_provider_error_alert(
+                e["email"], e["workspace_name"], e["category"],
+                e.get("detail", ""), e.get("response_code"),
+            )
+        # Group by (workspace, category) so one section per cluster
+        grouped: dict = defaultdict(list)
+        for e in entries:
+            grouped[(e["workspace_name"], e["category"])].append(e)
+
+        lines = [
+            f":warning: *Provider-Side Errors Detected — reconnect skipped*",
+            f"*Time:* {_now_pht()}",
+            "",
+        ]
+        for (ws_name, category), items in sorted(grouped.items()):
+            meta = self._PROVIDER_ERROR_META.get(category, {
+                "emoji": ":warning:",
+                "title": category.replace("_", " ").title(),
+                "cause": "Provider-side error.",
+                "recovery": "Investigate in Instantly.",
+            })
+            lines.append(f"{meta['emoji']} *{meta['title']}* — workspace `{ws_name}` ({len(items)} account{'s' if len(items) != 1 else ''})")
+            lines.append(f"_{meta['cause']}_")
+            for it in sorted(items, key=lambda x: x["email"]):
+                lines.append(f"  • {it['email']}")
+            lines.append(f":point_right: {meta['recovery']}")
+            lines.append("")
+        return self._send("\n".join(lines))
+
     # ── Public: daily limit adjustments ──────────────────────────────────────
 
     def send_daily_limit_adjusted_batch(self, adjustments: list, max_limit: int) -> bool:
@@ -341,6 +444,12 @@ class ReportData:
         # [{email, workspace_name, previous_limit, new_limit, success}]
         self.daily_limit_adjustments: List[Dict] = []
 
+        # Accounts hit by a provider-side error that reconnect can't fix
+        # (sending-limit, suspicious activity, mailbox full, etc.)
+        # [{email, workspace_name, category, detail, response_code,
+        #   auto_recoverable, first_alert_this_run}]
+        self.provider_errors: List[Dict] = []
+
     @property
     def total_workspaces(self) -> int:
         return len(self.workspace_summaries)
@@ -449,6 +558,25 @@ def _format_daily_report(r: ReportData) -> str:
             lines.append(f"• {item['email']} ({item['workspace_name']}) — {note}")
     else:
         lines.append(":white_check_mark: *All accounts connected.*")
+
+    # ── Provider-side errors (reconnect won't help; grouped separately) ──
+    if r.provider_errors:
+        lines.append("")
+        lines.append(":warning: *Provider-Side Errors* _(reconnect skipped — won't help)_")
+        # Group by category so users see clusters
+        by_cat: dict = defaultdict(list)
+        for item in r.provider_errors:
+            by_cat[item.get("category", "unknown")].append(item)
+        _CAT_LABELS = {
+            "sending_limit_exceeded": ":hourglass_flowing_sand: Daily Sending Limit Exceeded _(auto-recovers ~24h)_",
+            "suspicious_activity_blocked": ":rotating_light: Suspicious Activity Blocked _(needs human)_",
+            "mailbox_full": ":inbox_tray: Mailbox Storage Full",
+        }
+        for cat, items in sorted(by_cat.items()):
+            label = _CAT_LABELS.get(cat, f":warning: {cat.replace('_', ' ').title()}")
+            lines.append(f"*{label}*")
+            for item in sorted(items, key=lambda x: (x.get("workspace_name", ""), x.get("email", ""))):
+                lines.append(f"  • {item['email']} ({item['workspace_name']})")
 
     # ── Health alerts ──
     lines.append("")

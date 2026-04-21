@@ -373,6 +373,161 @@ class InstantlyClient:
         status = str(account.get("status", "")).lower()
         return status in ("2", "paused")
 
+    # ── Error classification ──────────────────────────────────────────────────
+    #
+    # Some "disconnected" states in Instantly are NOT reconnectable:
+    #   - Sending limit hit at Google/Microsoft (auto-recovers in ~24h)
+    #   - Provider flagged suspicious activity (needs human intervention)
+    # Pushing reconnects at these accounts wastes API calls, emits misleading
+    # Slack alerts, and leaves the user chasing a non-existent auth problem.
+    #
+    # We classify by inspecting Instantly's `status_message` — a dict with
+    # the raw SMTP response text from the provider (verified live against
+    # Textgrid workspace on 2026-04-21). Pattern matching is intentionally
+    # loose (case-insensitive substring) so new wording variations still map.
+    #
+    # Provider-agnostic: same classifier applies to Google (2), Microsoft (3),
+    # IMAP (1), and AWS (4) accounts because all SMTP providers return
+    # enhanced status codes (RFC 3463) in similar shapes.
+
+    # Signatures checked in priority order — first match wins.
+    # Keys = category; values = list of case-insensitive substrings.
+    _ERROR_SIGNATURES = (
+        ("sending_limit_exceeded", (
+            "5.4.5",                         # Gmail daily user sending limit
+            "daily user sending limit",
+            "daily sending quota",
+            "rate limit exceeded",
+            "throttled",
+            "exceeded the message limit",    # Outlook/O365
+            "exceeded its quota",
+        )),
+        ("suspicious_activity_blocked", (
+            "5.7.1",                         # Gmail spam / suspicious
+            "unusual sending",
+            "suspicious",
+            "this message was blocked",
+            "message rejected due to",
+            "550-5.7.26",                    # MS: unauthenticated relay
+        )),
+        ("authentication_failure", (
+            "5.7.8",                         # auth required / bad creds
+            "535",                           # SMTP auth failed
+            "authentication failed",
+            "username and password not accepted",
+            "invalid credentials",
+            "invalid login",
+            "application-specific password required",
+        )),
+        ("mailbox_full", (
+            "5.2.2",
+            "mailbox full",
+            "over quota",
+            "quota exceeded",
+        )),
+    )
+
+    # Categories whose auto-recovery path does NOT involve reconnecting.
+    # Reconnect is still attempted for authentication_failure and unknowns.
+    NON_RECONNECTABLE_CATEGORIES = frozenset({
+        "sending_limit_exceeded",
+        "suspicious_activity_blocked",
+        "mailbox_full",
+    })
+
+    @staticmethod
+    def classify_account_error(account: Dict) -> Dict:
+        """
+        Inspect an account's status and status_message to decide how to handle it.
+
+        Returns a dict:
+          {
+            "category": str,        # see categories below
+            "detail": str,          # human-readable summary of the underlying error
+            "response_code": int|None,  # SMTP response code if parseable
+            "autofix_failed": bool,     # Instantly's autofix signal (hint only)
+            "should_reconnect": bool,   # False for provider-side issues
+            "auto_recoverable": bool,   # True if the error clears itself (e.g. daily limits)
+          }
+
+        Categories:
+          - connected                   — status == 1/active
+          - paused                      — status == 2 (user-paused)
+          - sending_limit_exceeded      — provider daily-send cap hit; recovers in ~24h
+          - suspicious_activity_blocked — provider flagged sends; needs human
+          - authentication_failure      — credentials bad; reconnect will help
+          - mailbox_full                — recipient-side quota (rare on sender)
+          - disconnected_unknown        — error with no recognized signature
+        """
+        # Healthy states short-circuit — no inspection needed.
+        if InstantlyClient.is_connected(account):
+            return {
+                "category": "connected", "detail": "", "response_code": None,
+                "autofix_failed": False, "should_reconnect": False,
+                "auto_recoverable": False,
+            }
+        if InstantlyClient.is_paused(account):
+            return {
+                "category": "paused", "detail": "", "response_code": None,
+                "autofix_failed": False, "should_reconnect": False,
+                "auto_recoverable": False,
+            }
+
+        sm = account.get("status_message")
+        response_code: Optional[int] = None
+        text = ""
+
+        # Instantly returns status_message as a dict for SMTP errors (verified live)
+        # but defend against the string / None shapes other APIs sometimes send.
+        if isinstance(sm, dict):
+            rc = sm.get("responseCode") or sm.get("response_code")
+            try:
+                response_code = int(rc) if rc is not None else None
+            except (TypeError, ValueError):
+                response_code = None
+            # Concatenate every text-ish field so substring matching finds
+            # the signature wherever Instantly chose to put it.
+            for k in ("response", "e_message", "code", "command", "message"):
+                v = sm.get(k)
+                if v:
+                    text += f" {v}"
+        elif isinstance(sm, str):
+            text = sm
+        text = text.lower()
+
+        autofix_failed = bool(account.get("autofix_failed", False))
+
+        # Walk signatures in priority order — first match wins.
+        matched_category = "disconnected_unknown"
+        for cat, signatures in InstantlyClient._ERROR_SIGNATURES:
+            if any(sig in text for sig in signatures):
+                matched_category = cat
+                break
+
+        # Trim detail to the first 200 chars of the e_message (most human-readable)
+        # fall back to response, then to status value.
+        detail = ""
+        if isinstance(sm, dict):
+            detail = str(sm.get("e_message") or sm.get("response") or "").strip()
+        elif isinstance(sm, str):
+            detail = sm.strip()
+        if not detail:
+            detail = f"status={account.get('status')}"
+        if len(detail) > 240:
+            detail = detail[:237] + "..."
+
+        should_reconnect = matched_category not in InstantlyClient.NON_RECONNECTABLE_CATEGORIES
+        auto_recoverable = matched_category in ("sending_limit_exceeded",)
+
+        return {
+            "category": matched_category,
+            "detail": detail,
+            "response_code": response_code,
+            "autofix_failed": autofix_failed,
+            "should_reconnect": should_reconnect,
+            "auto_recoverable": auto_recoverable,
+        }
+
     @staticmethod
     def is_warming_up(account: Dict) -> bool:
         """True if the account is in warmup mode (warmup_status == 1).

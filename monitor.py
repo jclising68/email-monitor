@@ -315,6 +315,21 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
 
             else:
                 summary.disconnected += 1
+
+                # ── Classify the error FIRST ──────────────────────────────────
+                # Some "disconnected" states are actually provider throttles
+                # (Gmail 5.4.5 daily limit, suspicious-activity blocks, etc.).
+                # For those categories reconnecting is pointless — it wastes
+                # API calls, emits misleading Slack alerts, and the account
+                # would still be blocked after a successful reconnect.
+                err_info = InstantlyClient.classify_account_error(account)
+                if not err_info["should_reconnect"] and err_info["category"] not in ("connected", "paused"):
+                    _handle_non_reconnectable_error(
+                        email, ws_name, err_info, sheets, slack,
+                        alert_state, report, _cfg,
+                    )
+                    continue
+
                 provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set, missioninbox_client)
 
                 if provider == "missioninbox":
@@ -718,6 +733,91 @@ def _process_campaign_health(
                 "unsubscribed": unsubscribed,
                 "action_taken": action_taken,
             })
+
+
+def _handle_non_reconnectable_error(
+    email: str,
+    ws_name: str,
+    err_info: Dict,
+    sheets: SheetsClient,
+    slack: SlackReporter,
+    alert_state: Dict,
+    report: ReportData,
+    cfg: Config,
+) -> None:
+    """
+    Handle account errors that reconnect cannot fix (sending-limit,
+    suspicious-activity, mailbox-full, etc.). Provider-agnostic — the
+    category comes from InstantlyClient.classify_account_error() and
+    applies identically across Google, Microsoft, IMAP, and AWS accounts.
+
+    Behaviour:
+      - Never calls the reconnect APIs (would waste calls and confuse users).
+      - Alerts Slack once per provider_error_realert_hours (default 24h).
+      - Writes alert_state with status=category so subsequent runs know the
+        account is in a known error mode — recovery at the top of run() still
+        clears this when the account returns to status=1.
+      - Adds the entry to report.provider_errors so the daily Slack summary
+        lists it in its own section (not as a reconnect failure).
+    """
+    category = err_info["category"]
+    existing_row = alert_state.get(email)
+
+    # Dedupe: alert only on first detection, or once the realert window expires.
+    is_new = is_new_disconnection(email, alert_state)
+    should_real = should_realert(email, alert_state, cfg.provider_error_realert_hours)
+
+    # If the stored status differs from the new category, treat as a new
+    # alert condition — user needs to know the failure mode changed.
+    prev_status = (existing_row or {}).get("status", "")
+    category_changed = bool(existing_row) and prev_status != category
+
+    will_alert = is_new or should_real or category_changed
+    if will_alert:
+        slack.send_provider_error_alert(
+            email, ws_name, category,
+            err_info.get("detail", ""),
+            err_info.get("response_code"),
+        )
+        logger.info(
+            "Provider-side error alert sent for %s (%s): %s",
+            email, ws_name, category,
+        )
+    else:
+        logger.debug(
+            "Provider-side error for %s (%s) still active (%s) — within realert window, silent.",
+            email, ws_name, category,
+        )
+
+    # Persist state so subsequent runs see the category and stay silent
+    # until the realert window expires (or the account recovers).
+    now = utcnow_str()
+    first_detected = (existing_row or {}).get("first_detected") or now
+    last_alerted = now if will_alert else ((existing_row or {}).get("last_alerted") or now)
+    new_row = {
+        "email": email.lower(),
+        "workspace_name": ws_name,
+        "first_detected": first_detected,
+        "last_alerted": last_alerted,
+        "reconnect_attempts": int((existing_row or {}).get("reconnect_attempts", 0)),
+        "status": category,
+    }
+    try:
+        sheets.upsert_alert_state(**new_row)
+        alert_state[email] = new_row
+    except Exception as exc:
+        logger.error("Failed to write alert_state for provider error %s: %s", email, exc)
+
+    # Feed the daily report — surfaces these separately from reconnect failures.
+    report.provider_errors.append({
+        "email": email,
+        "workspace_name": ws_name,
+        "category": category,
+        "detail": err_info.get("detail", ""),
+        "response_code": err_info.get("response_code"),
+        "auto_recoverable": err_info.get("auto_recoverable", False),
+        "first_alert_this_run": will_alert,
+    })
 
 
 def _handle_missioninbox_disconnect(

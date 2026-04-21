@@ -113,6 +113,14 @@ class Config:
             get_env("DAILY_LIMIT_MAX", required=False, default="30")
         )
 
+        # Non-reconnectable provider errors (e.g. Gmail "daily user sending
+        # limit exceeded") auto-recover over time. We re-alert after this many
+        # hours if the error is still present so operators don't forget about
+        # a stuck account. 0 disables re-alerting (first alert only).
+        self.provider_error_realert_hours: int = int(
+            get_env("PROVIDER_ERROR_REALERT_HOURS", required=False, default="24")
+        )
+
     def configure_logging(self):
         logging.basicConfig(
             level=getattr(logging, self.log_level, logging.INFO),
