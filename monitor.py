@@ -414,6 +414,17 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             report.daily_limit_adjustments, _cfg.daily_limit_max,
         )
 
+    # ── Provider-side errors — one batched Slack message per run ─────────────
+    # Per-account 24h dedup already happened inside _handle_non_reconnectable_error
+    # (entries with first_alert_this_run=False stay out of the batch). So when
+    # many Gmail mailboxes hit the 24h cap in the same run they produce ONE
+    # grouped Slack message instead of one message per account.
+    fresh_provider_errors = [
+        e for e in report.provider_errors if e.get("first_alert_this_run")
+    ]
+    if fresh_provider_errors:
+        slack.send_provider_error_batch(fresh_provider_errors)
+
     # ── Daily report ──────────────────────────────────────────────────────────
     if send_report:
         logger.info("Sending daily Slack report.")
@@ -774,13 +785,8 @@ def _handle_non_reconnectable_error(
 
     will_alert = is_new or should_real or category_changed
     if will_alert:
-        slack.send_provider_error_alert(
-            email, ws_name, category,
-            err_info.get("detail", ""),
-            err_info.get("response_code"),
-        )
         logger.info(
-            "Provider-side error alert sent for %s (%s): %s",
+            "Provider-side error staged for batched alert: %s (%s): %s",
             email, ws_name, category,
         )
     else:

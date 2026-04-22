@@ -100,12 +100,11 @@ def case_first_detection():
         err_info, sheets, slack, alert_state, report, cfg,
     )
 
-    # Must have called Slack exactly once
-    assert slack.send_provider_error_alert.call_count == 1, \
-        f"expected 1 Slack call, got {slack.send_provider_error_alert.call_count}"
-    # Slack call got the right category
-    call_args = slack.send_provider_error_alert.call_args
-    assert call_args.args[2] == "sending_limit_exceeded", f"category mismatch: {call_args}"
+    # Handler must NOT call Slack directly — batched send happens post-loop in run().
+    assert slack.send_provider_error_alert.call_count == 0, \
+        "handler should stage for batching, not call Slack inline"
+    assert slack.send_provider_error_batch.call_count == 0, \
+        "handler should not call the batch method either"
     # alert_state written
     assert sheets.upsert_alert_state.call_count == 1
     # In-memory alert_state updated
@@ -187,9 +186,12 @@ def case_category_change_triggers_alert():
         alert_state, report, cfg,
     )
 
-    # Category changed → alert again
-    assert slack.send_provider_error_alert.call_count == 1, \
-        "category change should trigger re-alert"
+    # Category changed → staged for batched alert (first_alert_this_run=True)
+    assert slack.send_provider_error_alert.call_count == 0, \
+        "handler should not call Slack inline — batching happens post-loop"
+    assert len(report.provider_errors) == 1
+    assert report.provider_errors[0]["first_alert_this_run"] is True, \
+        "category change must flag the entry as a fresh alert so the batch picks it up"
     # State now reflects the new category
     assert alert_state["foo@bar.com"]["status"] == "suspicious_activity_blocked"
 
