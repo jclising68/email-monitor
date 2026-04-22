@@ -78,8 +78,10 @@ def _get_oauth_credentials() -> OAuthCredentials:
 
 TAB_WORKSPACES  = "Workspaces"
 TAB_ALERT_STATE = "alert_state"   # created automatically on first run (lowercase is fine)
+TAB_META        = "meta"          # small key/value store for idempotency flags
 
-_AS_COLS = ["email", "workspace_name", "first_detected", "last_alerted", "reconnect_attempts", "status"]
+_AS_COLS   = ["email", "workspace_name", "first_detected", "last_alerted", "reconnect_attempts", "status"]
+_META_COLS = ["key", "value"]
 
 class SheetsClient:
     def __init__(self, credentials_dict: dict, sheet_id: str):
@@ -111,11 +113,16 @@ class SheetsClient:
                 try:
                     return self._open().worksheet(tab)
                 except gspread.exceptions.WorksheetNotFound:
-                    # Auto-create the alert_state tab if missing
+                    # Auto-create alert_state and meta tabs if missing
                     if tab == TAB_ALERT_STATE:
                         logger.info("Creating missing '%s' tab in Google Sheet.", tab)
                         ws = self._open().add_worksheet(title=tab, rows=1000, cols=len(_AS_COLS))
                         ws.append_row(_AS_COLS)
+                        return ws
+                    if tab == TAB_META:
+                        logger.info("Creating missing '%s' tab in Google Sheet.", tab)
+                        ws = self._open().add_worksheet(title=tab, rows=100, cols=len(_META_COLS))
+                        ws.append_row(_META_COLS)
                         return ws
                     raise
             except gspread.exceptions.WorksheetNotFound:
@@ -232,4 +239,33 @@ class SheetsClient:
             if v > row_num:
                 index[k] = v - 1
         logger.debug("Deleted alert_state row %d for %s (account recovered)", row_num, email)
+
+    # ── Meta key/value store (idempotency flags) ──────────────────────────────
+
+    def get_meta(self, key: str) -> Optional[str]:
+        """Return the stored value for a meta key, or None if absent."""
+        ws = self._worksheet(TAB_META)
+        if not ws.row_values(1):
+            ws.append_row(_META_COLS)
+            return None
+        rows = ws.get_all_records(expected_headers=_META_COLS)
+        for row in rows:
+            if str(row.get("key", "")).strip() == key:
+                return str(row.get("value", "")).strip()
+        return None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Upsert a meta key/value row."""
+        ws = self._worksheet(TAB_META)
+        if not ws.row_values(1):
+            ws.append_row(_META_COLS)
+        keys_col = ws.col_values(1)[1:]  # skip header
+        for i, existing_key in enumerate(keys_col):
+            if existing_key.strip() == key:
+                row_num = i + 2
+                ws.update(f"A{row_num}:B{row_num}", [[key, value]])
+                logger.debug("Updated meta row %d: %s=%s", row_num, key, value)
+                return
+        ws.append_row([key, value])
+        logger.debug("Appended meta row: %s=%s", key, value)
 

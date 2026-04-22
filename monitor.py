@@ -14,6 +14,9 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+_PHT = ZoneInfo("Asia/Manila")
 
 try:
     from config import Config
@@ -72,7 +75,7 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
     if not workspaces:
         logger.warning("No active workspaces found in Sheets. Nothing to do.")
         if send_report:
-            slack.send_daily_report(report)
+            _send_daily_report_once(sheets, slack, report)
         return
 
     # ── Per-workspace processing ──────────────────────────────────────────────
@@ -425,17 +428,71 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
     if fresh_provider_errors:
         slack.send_provider_error_batch(fresh_provider_errors)
 
-    # ── Daily report ──────────────────────────────────────────────────────────
+    # ── Daily report (guarded: once per PHT calendar day) ────────────────────
     if send_report:
-        logger.info("Sending daily Slack report.")
-        slack.send_daily_report(report)
+        _send_daily_report_once(sheets, slack, report)
 
-    # ── Weekly domain health report ──────────────────────────────────────────
+    # ── Weekly report (guarded: once per ISO week) ───────────────────────────
     if send_weekly_report:
-        logger.info("Sending weekly domain health report.")
-        slack.send_weekly_domain_report(report)
+        _send_weekly_report_once(sheets, slack, report)
 
     logger.info("=== Email Monitor finished ===")
+
+
+# ── Report idempotency ───────────────────────────────────────────────────────
+
+_META_KEY_DAILY  = "last_daily_report_date"
+_META_KEY_WEEKLY = "last_weekly_report_week"
+
+
+def _send_daily_report_once(sheets: SheetsClient, slack: SlackReporter,
+                            report: ReportData) -> None:
+    """
+    Send the daily Slack report — but only once per PHT calendar day.
+    Subsequent --report invocations the same day (delayed cron retry,
+    manual workflow_dispatch, etc.) are silent no-ops.
+    """
+    today_pht = datetime.now(_PHT).strftime("%Y-%m-%d")
+    try:
+        last_sent = sheets.get_meta(_META_KEY_DAILY)
+    except Exception as exc:
+        logger.warning("Could not read daily-report meta (%s) — will send anyway.", exc)
+        last_sent = None
+    if last_sent == today_pht:
+        logger.info("Daily report already sent today (%s) — skipping duplicate.", today_pht)
+        return
+    logger.info("Sending daily Slack report.")
+    if slack.send_daily_report(report):
+        try:
+            sheets.set_meta(_META_KEY_DAILY, today_pht)
+        except Exception as exc:
+            logger.error(
+                "Daily report sent but failed to persist last-sent date (%s) — "
+                "next run may re-send: %s", today_pht, exc,
+            )
+
+
+def _send_weekly_report_once(sheets: SheetsClient, slack: SlackReporter,
+                             report: ReportData) -> None:
+    """Send the weekly domain-health report — once per ISO week in PHT."""
+    this_week = datetime.now(_PHT).strftime("%G-W%V")
+    try:
+        last_sent = sheets.get_meta(_META_KEY_WEEKLY)
+    except Exception as exc:
+        logger.warning("Could not read weekly-report meta (%s) — will send anyway.", exc)
+        last_sent = None
+    if last_sent == this_week:
+        logger.info("Weekly report already sent this week (%s) — skipping duplicate.", this_week)
+        return
+    logger.info("Sending weekly domain health report.")
+    if slack.send_weekly_domain_report(report):
+        try:
+            sheets.set_meta(_META_KEY_WEEKLY, this_week)
+        except Exception as exc:
+            logger.error(
+                "Weekly report sent but failed to persist last-sent week (%s) — "
+                "next run may re-send: %s", this_week, exc,
+            )
 
 
 # ── Disconnect handlers ───────────────────────────────────────────────────────
