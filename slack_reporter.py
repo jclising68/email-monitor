@@ -395,8 +395,9 @@ class SlackReporter:
 # ── Report data structures ────────────────────────────────────────────────────
 
 class WorkspaceSummary:
-    def __init__(self, name: str):
+    def __init__(self, name: str, tool: str = "instantly"):
         self.name = name
+        self.tool = tool   # "instantly" or "lemlist"
         self.connected: int = 0
         self.warmup: int = 0
         self.paused: int = 0
@@ -452,7 +453,8 @@ class ReportData:
 
     @property
     def total_workspaces(self) -> int:
-        return len(self.workspace_summaries)
+        # Count unique base workspace names (strips "[Instantly]" / "[Lemlist]" suffixes)
+        return len({w.name.split(" [")[0] for w in self.workspace_summaries})
 
     @property
     def total_connected(self) -> int:
@@ -460,11 +462,11 @@ class ReportData:
 
     @property
     def total_warmup(self) -> int:
-        return sum(w.warmup for w in self.workspace_summaries)
+        return sum(w.warmup for w in self.workspace_summaries if w.tool == "instantly")
 
     @property
     def total_paused(self) -> int:
-        return sum(w.paused for w in self.workspace_summaries)
+        return sum(w.paused for w in self.workspace_summaries if w.tool == "instantly")
 
     @property
     def total_disconnected(self) -> int:
@@ -472,7 +474,7 @@ class ReportData:
 
     @property
     def total_dns_issues(self) -> int:
-        return sum(w.dns_issues for w in self.workspace_summaries)
+        return sum(w.dns_issues for w in self.workspace_summaries if w.tool == "instantly")
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -490,13 +492,17 @@ def _format_daily_report(r: ReportData) -> str:
         max_name_len = max(len(w.name) for w in r.workspace_summaries)
         for w in sorted(r.workspace_summaries, key=lambda x: x.name):
             pad = max_name_len - len(w.name)
-            total_online = w.connected + w.warmup
-            warmup_tag = f" ({w.warmup} warmup)" if w.warmup else ""
-            parts = [f"{total_online} connected{warmup_tag}"]
-            if w.paused:
-                parts.append(f"{w.paused} paused")
-            parts.append(f"{w.disconnected} disconnected")
-            parts.append(f"{w.dns_issues} DNS issues")
+            if w.tool == "lemlist":
+                parts = [f"{w.connected} connected"]
+                parts.append(f"{w.disconnected} disconnected")
+            else:
+                total_online = w.connected + w.warmup
+                warmup_tag = f" ({w.warmup} warmup)" if w.warmup else ""
+                parts = [f"{total_online} connected{warmup_tag}"]
+                if w.paused:
+                    parts.append(f"{w.paused} paused")
+                parts.append(f"{w.disconnected} disconnected")
+                parts.append(f"{w.dns_issues} DNS issues")
             lines.append(f"`{w.name}`{' ' * pad}   " + " | ".join(parts))
     else:
         lines.append("_No workspaces checked._")
@@ -546,6 +552,8 @@ def _format_daily_report(r: ReportData) -> str:
             if reason:
                 # Specific reason (e.g. payment pending) — show directly
                 note = reason
+            elif provider == "lemlist":
+                note = "Lemlist account — reconnect manually in Lemlist dashboard"
             elif provider == "client":
                 note = "Client account — notify client to reconnect in Instantly"
             elif provider in ("zapmail", "missioninbox") and attempts == 0:

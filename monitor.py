@@ -28,6 +28,7 @@ except EnvironmentError as _env_err:
     sys.exit(1)
 
 from instantly_client import InstantlyClient, InstantlyAPIError
+from lemlist_client import LemlistClient
 from missioninbox_client import MissionInboxClient
 from reconnect import attempt_reconnect, attempt_post_only
 from sheets_client import SheetsClient
@@ -402,6 +403,13 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             _process_campaign_health(campaigns, ws_name, client, report, _cfg)
         except Exception as exc:
             logger.warning("Campaign analytics failed for %s: %s (non-fatal)", ws_name, exc)
+
+        # ── Lemlist processing (if workspace has Lemlist configured) ──────────────
+        lemlist_api_key = ws.get("lemlist_api_key", "")
+        if lemlist_api_key:
+            # Rename Instantly summary so the tool is clear in the report
+            summary.name = f"{ws_name} [Instantly]"
+            _process_lemlist_workspace(ws_name, lemlist_api_key, report, sheets, alert_state, _cfg)
 
         report.workspace_summaries.append(summary)
         logger.info(
@@ -799,6 +807,181 @@ def _process_campaign_health(
                 "open_rate": open_rate,
                 "clicks": clicks,
                 "unsubscribed": unsubscribed,
+                "action_taken": action_taken,
+            })
+
+
+def _process_lemlist_workspace(
+    ws_name: str,
+    api_key: str,
+    report: ReportData,
+    sheets: SheetsClient,
+    alert_state: Dict,
+    cfg: "Config",
+) -> None:
+    """
+    Fetch and process all Lemlist email accounts for a workspace.
+
+    Per-account connection status comes from a live SMTP/IMAP test
+    (Lemlist has no native status field in the account listing).
+    No auto-reconnect is available for Lemlist — disconnected accounts
+    appear in the daily report and must be fixed manually in Lemlist.
+
+    Campaign bounce rates are checked using the same thresholds as Instantly.
+    Warmup health is not available via the Lemlist API.
+    """
+    client = LemlistClient(api_key)
+    summary = WorkspaceSummary(f"{ws_name} [Lemlist]", tool="lemlist")
+
+    try:
+        accounts = client.get_accounts()
+    except Exception as exc:
+        logger.error("Lemlist workspace %s: failed to get accounts: %s", ws_name, exc)
+        report.workspace_errors.append({"workspace_name": f"{ws_name} [Lemlist]", "error": str(exc)})
+        return
+
+    for account in accounts:
+        email = str(account.get("email", "")).strip().lower()
+        account_id = str(account.get("id", "")).strip()
+        provider = str(account.get("provider", "")).strip().lower()
+        if not email or not account_id:
+            continue
+
+        # Google and Microsoft accounts use OAuth2 — the SMTP/IMAP test endpoint
+        # always returns false for them even when connected (OAuth2 tokens are not
+        # raw SMTP credentials). Treat OAuth2 accounts as connected if they appear
+        # in the accounts list; Lemlist manages their OAuth state internally.
+        # Only run the live test for custom SMTP/IMAP accounts where it is reliable.
+        if LemlistClient.is_oauth_provider(provider):
+            connected = True
+        else:
+            test_result = client.test_account(account_id)
+            connected = LemlistClient.is_connected(test_result)
+
+        if connected:
+            summary.connected += 1
+            if email in alert_state:
+                logger.info("Lemlist account %s (%s) recovered — clearing alert state.", email, ws_name)
+                try:
+                    sheets.delete_alert_state(email)
+                    del alert_state[email]
+                except Exception as exc:
+                    logger.error("Failed to clear alert_state for Lemlist %s: %s", email, exc)
+        else:
+            summary.disconnected += 1
+            if is_new_disconnection(email, alert_state):
+                existing_row = alert_state.get(email, {})
+                new_row = {
+                    "email": email.lower(),
+                    "workspace_name": ws_name,
+                    "first_detected": existing_row.get("first_detected") or utcnow_str(),
+                    "last_alerted": utcnow_str(),
+                    "reconnect_attempts": 0,
+                    "status": "lemlist_disconnected",
+                }
+                try:
+                    sheets.upsert_alert_state(**new_row)
+                    alert_state[email] = new_row
+                except Exception as exc:
+                    logger.error("Failed to write alert_state for Lemlist %s: %s", email, exc)
+            report.still_disconnected.append({
+                "email": email,
+                "workspace_name": ws_name,
+                "provider": "lemlist",
+                "attempts": 0,
+            })
+
+    # ── Campaign bounce check ─────────────────────────────────────────────────
+    try:
+        end_dt   = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=7)
+        end_str   = end_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        campaigns = client.get_campaigns()
+        running_campaigns = [c for c in campaigns if c.get("status") == "running"]
+        if running_campaigns:
+            campaign_ids = [c["_id"] for c in running_campaigns]
+            name_map = {c["_id"]: c.get("name", "Unknown") for c in running_campaigns}
+            stats_list = client.get_campaign_stats_batch(campaign_ids, start_str, end_str)
+            _process_lemlist_campaign_health(stats_list, name_map, ws_name, client, report, cfg)
+    except Exception as exc:
+        logger.warning("Lemlist campaign analytics failed for %s: %s (non-fatal)", ws_name, exc)
+
+    report.workspace_summaries.append(summary)
+    logger.info(
+        "Lemlist workspace %s: %d connected, %d disconnected.",
+        ws_name, summary.connected, summary.disconnected,
+    )
+
+
+def _process_lemlist_campaign_health(
+    stats_list: List[Dict],
+    name_map: Dict[str, str],
+    ws_name: str,
+    client: "LemlistClient",
+    report: ReportData,
+    cfg: "Config",
+) -> None:
+    """
+    Check Lemlist campaign bounce rates using the same thresholds as Instantly.
+    Fields: messagesSent, messagesBounced, replied, nbLeads, nbLeadsLaunched, opened, clicked.
+    """
+    for stats in stats_list:
+        campaign_id = stats.get("campaignId", "")
+        name = name_map.get(campaign_id, "Unknown")
+        sent    = int(stats.get("messagesSent") or 0)
+        bounced = int(stats.get("messagesBounced") or 0)
+        replied = int(stats.get("replied") or 0)
+
+        if sent < cfg.campaign_min_sent_for_bounce_check:
+            continue
+
+        bounce_rate = (bounced / sent * 100) if sent > 0 else 0.0
+
+        if bounce_rate >= cfg.bounce_rate_alert_threshold:
+            reply_rate = (replied / sent * 100) if sent > 0 else 0.0
+            action_taken = ""
+
+            should_pause = (
+                bounce_rate >= cfg.campaign_bounce_pause_threshold
+                and bool(campaign_id)
+            )
+            if should_pause:
+                try:
+                    paused = client.pause_campaign(campaign_id)
+                    if paused:
+                        action_taken = "Auto-paused campaign — re-verify lead list before resuming"
+                        logger.warning(
+                            "Auto-paused Lemlist campaign '%s' (%s) — bounce rate %.1f%% exceeds %d%%.",
+                            name, ws_name, bounce_rate, cfg.campaign_bounce_pause_threshold,
+                        )
+                    else:
+                        action_taken = "Auto-pause failed — pause manually in Lemlist and re-verify lead list"
+                except Exception as exc:
+                    action_taken = "Auto-pause failed — pause manually in Lemlist and re-verify lead list"
+                    logger.error("Error auto-pausing Lemlist campaign '%s' (%s): %s", name, ws_name, exc)
+            else:
+                action_taken = "Review lead list quality — consider re-verifying emails before sending more"
+
+            logger.warning(
+                "High bounce rate for Lemlist campaign '%s' (%s): %.1f%% (%d/%d) — %s",
+                name, ws_name, bounce_rate, bounced, sent, action_taken,
+            )
+            report.bounce_alerts.append({
+                "campaign_name": f"{name} (Lemlist)",
+                "workspace_name": ws_name,
+                "bounce_rate": bounce_rate,
+                "bounced": bounced,
+                "sent": sent,
+                "contacted": int(stats.get("nbLeadsLaunched") or 0),
+                "total_leads": int(stats.get("nbLeads") or 0),
+                "reply_rate": reply_rate,
+                "replies": replied,
+                "opens": int(stats.get("opened") or 0),
+                "open_rate": 0.0,
+                "clicks": int(stats.get("clicked") or 0),
+                "unsubscribed": 0,
                 "action_taken": action_taken,
             })
 

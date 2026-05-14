@@ -160,6 +160,8 @@ class SheetsClient:
                 "zapmail_workspace_key_microsoft": str(row.get("zapmail_workspace_key_microsoft", "")).strip(),
                 # Optional Mission Inbox API key — empty string if not present
                 "mission_inbox_api_key":    str(row.get("mission_inbox_api_key", "")).strip(),
+                # Optional Lemlist API key — empty string if not present
+                "lemlist_api_key":          str(row.get("lemlist_api_key", "")).strip(),
             })
         logger.debug("Loaded %d active workspace(s) from Sheets.", len(result))
         return result
