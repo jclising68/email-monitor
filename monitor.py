@@ -85,6 +85,14 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         api_key  = ws["api_key"]
         logger.info("Processing workspace: %s", ws_name)
 
+        # Workspaces that only use Lemlist (no Instantly api_key) skip Instantly
+        # processing entirely and go straight to Lemlist at the bottom of the loop.
+        if not api_key:
+            lemlist_api_key = ws.get("lemlist_api_key", "")
+            if lemlist_api_key:
+                _process_lemlist_workspace(ws_name, lemlist_api_key, report, sheets, alert_state, _cfg)
+            continue
+
         client  = InstantlyClient(api_key, base_url=_cfg.instantly_base_url)
         summary = WorkspaceSummary(ws_name)
 

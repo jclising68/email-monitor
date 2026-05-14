@@ -137,8 +137,10 @@ class SheetsClient:
     def get_workspaces(self) -> List[Dict]:
         """
         Return list of active workspace dicts.
-        Required columns : workspace_name, api_key, active
-        Optional columns : zapmail_workspace_key_google, zapmail_workspace_key_microsoft, mission_inbox_api_key
+        Required columns : workspace_name, active
+        Optional columns : api_key (Instantly), lemlist_api_key, zapmail_workspace_key_google,
+                           zapmail_workspace_key_microsoft, mission_inbox_api_key
+        A workspace with only lemlist_api_key (no Instantly api_key) is valid.
         """
         ws = self._worksheet(TAB_WORKSPACES)
         rows = ws.get_all_records()  # no expected_headers — extra cols are optional
@@ -149,8 +151,9 @@ class SheetsClient:
                 continue
             ws_name = str(row.get("workspace_name", "")).strip()
             api_key = str(row.get("api_key", "")).strip()
-            if not ws_name or not api_key:
-                logger.warning("Skipping workspace row with missing name or api_key: %s", row)
+            lemlist_api_key = str(row.get("lemlist_api_key", "")).strip()
+            if not ws_name or (not api_key and not lemlist_api_key):
+                logger.warning("Skipping workspace row with missing name or all api keys: %s", row)
                 continue
             result.append({
                 "workspace_name":           ws_name,
