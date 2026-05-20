@@ -144,6 +144,8 @@ class SheetsClient:
         """
         ws = self._worksheet(TAB_WORKSPACES)
         rows = ws.get_all_records()  # no expected_headers — extra cols are optional
+        # Normalize: strip whitespace from column header keys (guards against accidental spaces)
+        rows = [{k.strip(): v for k, v in row.items()} for row in rows]
         result = []
         for row in rows:
             active = str(row.get("active", "")).strip().upper()
