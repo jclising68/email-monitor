@@ -451,6 +451,12 @@ class ReportData:
         #   auto_recoverable, first_alert_this_run}]
         self.provider_errors: List[Dict] = []
 
+        # Signature status (Instantly workspaces only)
+        # Missing: [{email, workspace_name}]
+        # Checked: {workspace_name: total_count}
+        self.signature_issues: List[Dict] = []
+        self.signature_checked_by_ws: Dict[str, int] = {}
+
     @property
     def total_workspaces(self) -> int:
         # Count unique base workspace names (strips "[Instantly]" / "[Lemlist]" suffixes)
@@ -674,6 +680,26 @@ def _format_daily_report(r: ReportData) -> str:
                 ok = item.get("success", True)
                 tag = "" if ok else " :x: _(update failed)_"
                 lines.append(f"  • {item['email']} — {prev} → {new}{tag}")
+
+    # ── Signature status ──
+    total_sig_checked = sum(r.signature_checked_by_ws.values()) if r.signature_checked_by_ws else 0
+    if total_sig_checked:
+        lines.append("")
+        missing_count = len(r.signature_issues)
+        ok_count = total_sig_checked - missing_count
+        if r.signature_issues:
+            lines.append(f":pen: *Signature Status* — {ok_count}/{total_sig_checked} accounts have a signature")
+            by_ws: dict = defaultdict(list)
+            for item in r.signature_issues:
+                by_ws[item["workspace_name"]].append(item["email"])
+            for ws_name_sig, emails_missing in sorted(by_ws.items()):
+                total_ws = r.signature_checked_by_ws.get(ws_name_sig, len(emails_missing))
+                ok_ws = total_ws - len(emails_missing)
+                lines.append(f"  *{ws_name_sig}* — {ok_ws}/{total_ws} have signature")
+                for em in sorted(emails_missing):
+                    lines.append(f"    • {em}")
+        else:
+            lines.append(f":pen: *Signature Status* — all {total_sig_checked} accounts have a signature :white_check_mark:")
 
     # ── DNS issues ──
     lines.append("")

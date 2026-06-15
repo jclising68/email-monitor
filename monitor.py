@@ -412,6 +412,15 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         except Exception as exc:
             logger.warning("Campaign analytics failed for %s: %s (non-fatal)", ws_name, exc)
 
+        # ── Signature check (read from account data already fetched — no extra API call) ──
+        report.signature_checked_by_ws[ws_name] = len(accounts)
+        for _acct in accounts:
+            _email = str(_acct.get("email", "")).strip().lower()
+            if not _email:
+                continue
+            if not str(_acct.get("signature") or "").strip():
+                report.signature_issues.append({"email": _email, "workspace_name": ws_name})
+
         # ── Lemlist processing (if workspace has Lemlist configured) ──────────────
         lemlist_api_key = ws.get("lemlist_api_key", "")
         if lemlist_api_key:
