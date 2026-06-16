@@ -319,8 +319,9 @@ class InstantlyClient:
     def pause_campaign(self, campaign_id: str) -> bool:
         """Pause a campaign to stop all sending. Returns True on success."""
         try:
-            # Instantly v2: POST /campaigns/{id}/pause
-            self._request("POST", f"/campaigns/{campaign_id}/pause")
+            # Instantly v2: POST /campaigns/{id}/pause — json={} needed because
+            # the session always sets Content-Type: application/json
+            self._request("POST", f"/campaigns/{campaign_id}/pause", json={})
             logger.info("Paused campaign %s.", campaign_id)
             return True
         except InstantlyAPIError as exc:
@@ -333,8 +334,9 @@ class InstantlyClient:
     def pause_account(self, email: str) -> bool:
         """Pause an account — stops all sending and warmup. Returns True on success."""
         try:
-            # Instantly v2: POST /accounts/{email}/pause
-            self._request("POST", f"/accounts/{email}/pause")
+            # Instantly v2: POST /accounts/{email}/pause — json={} needed because
+            # the session always sets Content-Type: application/json
+            self._request("POST", f"/accounts/{email}/pause", json={})
             logger.info("Paused account %s.", email)
             return True
         except InstantlyAPIError as exc:
