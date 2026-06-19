@@ -2,10 +2,10 @@ name: Email Monitor
 
 on:
   schedule:
-    # Every 2 hours at :00 EXCEPT 4 AM UTC (handled by the daily cron)
-    - cron: '0 0,2,6,8,10,12,14,16,18,20,22 * * *'
-    # 4 AM UTC = 12 PM PHT — daily report (+ weekly on Monday, detected in script)
-    - cron: '0 4 * * *'
+    # Every 2 hours at :00 — all even hours (3 AM UTC slot handled by daily cron)
+    - cron: '0 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
+    # 3 AM UTC = 11 AM PHT — daily report (arrives ~12 PM PHT accounting for GHA delays)
+    - cron: '0 3 * * *'
   workflow_dispatch:       # Allow manual runs from GitHub UI
     inputs:
       report:
@@ -61,8 +61,8 @@ jobs:
           elif [ "${{ github.event.inputs.report }}" = "true" ]; then
             echo "Running daily report (manual)..."
             python monitor.py --report
-          # Scheduled: 4 AM UTC = 12 PM PHT — daily report (+ weekly on Monday)
-          elif [ "$SCHEDULE" = "0 4 * * *" ]; then
+          # Scheduled: 3 AM UTC = 11 AM PHT — daily report (+ weekly on Monday)
+          elif [ "$SCHEDULE" = "0 3 * * *" ]; then
             if [ "$DAY_OF_WEEK" = "1" ]; then
               echo "Running daily + weekly domain health report (Monday)..."
               python monitor.py --report --weekly-report
