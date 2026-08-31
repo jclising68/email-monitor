@@ -1,22 +1,27 @@
 """
 scaledmail_client.py — ScaledMail API wrapper.
 
-Auth     : Authorization: Bearer <API_KEY>   (one global key)
-Scope    : organization_id query param on every request (one per client, from the Sheet)
-Base URL : https://api.scaledmail.com/api/v1  (override via SCALEDMAIL_API_BASE_URL)
+Base URL : https://server.scaledmail.com/api/v1   (override via SCALEDMAIL_API_BASE_URL)
+Auth     : Authorization: Bearer <API_KEY>        (one global key, per ScaledMail account)
+Scope    : organization_id on every request       (one per client, from the Sheet)
 Limits   : 5 requests/second — a small throttle is applied between calls.
+Docs     : https://api.scaledmail.com/scaledmail-api-documentaion-1034165m0
 
-Status: PHASE 1.
-  - list_mailboxes() + billing detection are wired and used for disconnection
-    *alerting* today.
-  - reconnect_email() is a stub: the re-push action and exact endpoint paths
-    need confirming against the full docs (requires an API key). Until then,
-    disconnections are alert-only.
+What the PUBLIC docs cover (confirmed):
+  - GET /organizations
+  - Get Domains, "Get Mailboxes by Domain ID", "Get Reporting Stats"
+    (these are named in the docs nav; exact paths are NOT published — the page
+     says "reach out to support@scaledmail.com ... for feature requests")
+  - POST /buy-pre-warm-inboxes  — buys NEW inboxes and, via a `sequencer` object
+    ({provider, username, password, link, workspace, tag}), auto-pushes them to
+    Instantly / Smartlead / etc. using YOUR sequencer login.
 
-TODO(after API key):
-  - confirm base URL + the mailboxes list path and response shape
-  - confirm a stats / billing / orders path for payment-hold detection
-  - implement reconnect_email()
+What the public docs do NOT cover: re-pushing / reconnecting an *existing*
+mailbox to a sequencer. reconnect_email() stays a stub until ScaledMail confirms
+that endpoint (see the comment on it).
+
+This client uses only GET reads and tolerates 404s (paths are best-effort),
+so a wrong guess degrades to "alert only", never a destructive call.
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "https://api.scaledmail.com/api/v1"
+_DEFAULT_BASE_URL = "https://server.scaledmail.com/api/v1"
 _MAX_RETRIES = 4
 _MIN_INTERVAL = 0.25  # seconds between requests (<= 5 req/s limit)
 
@@ -111,43 +116,75 @@ class ScaledMailClient:
 
         raise ScaledMailAPIError(0, f"Max retries exceeded for {method} {path}") from last_exc
 
-    # ── Reads ────────────────────────────────────────────────────────────────
+    def _get_first_ok(self, paths: List[str], *, params: Optional[Dict] = None):
+        """Try each candidate path; return the first non-404 JSON body, or None."""
+        for p in paths:
+            try:
+                return self._request("GET", p, params=params)
+            except ScaledMailAPIError as exc:
+                if exc.status_code in (404, 405):
+                    continue
+                raise
+        logger.warning("ScaledMail: none of %s responded — is the path published yet?", paths)
+        return None
+
+    @staticmethod
+    def _unwrap_list(result) -> List[Dict]:
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            data = result.get("data", result)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("mailboxes", "inboxes", "domains", "accounts", "items", "results"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+        return []
+
+    # ── Reads (documented capabilities) ──────────────────────────────────────
+
+    def list_domains(self) -> List[Dict]:
+        """Get Domains for this organization. Each domain dict carries an 'id'."""
+        result = self._get_first_ok(["/domains", "/get-domains"])
+        self._detect_billing_status(result if isinstance(result, dict) else {})
+        return self._unwrap_list(result)
 
     def list_mailboxes(self) -> List[Dict]:
         """
-        Return all mailboxes in this organization. Each dict is expected to carry
-        at least 'email' and a status field.
-
-        TODO(after API key): confirm the path ('/mailboxes' assumed) and shape.
+        All mailboxes in this organization. The docs expose "Get Mailboxes by
+        Domain ID", so we walk domains -> mailboxes. A flat listing is tried
+        first in case the account also exposes one.
         """
-        result = self._request("GET", "/mailboxes")
-        self._detect_billing_status(result)
+        flat = self._get_first_ok(["/mailboxes", "/get-mailboxes", "/inboxes"])
+        if flat is not None:
+            self._detect_billing_status(flat if isinstance(flat, dict) else {})
+            mbs = self._unwrap_list(flat)
+            if mbs:
+                return mbs
 
-        if isinstance(result, list):
-            return result
-        data = result.get("data", result)
-        if isinstance(data, dict):
-            for key in ("mailboxes", "inboxes", "accounts", "items", "results"):
-                if isinstance(data.get(key), list):
-                    return data[key]
-        elif isinstance(data, list):
-            return data
-        logger.warning("ScaledMail list_mailboxes: unexpected response shape.")
-        return []
+        mailboxes: List[Dict] = []
+        for dom in self.list_domains():
+            dom_id = dom.get("id") or dom.get("domain_id") or dom.get("_id")
+            if not dom_id:
+                continue
+            res = self._get_first_ok(
+                ["/mailboxes", f"/domains/{dom_id}/mailboxes", "/get-mailboxes-by-domain"],
+                params={"domain_id": dom_id},
+            )
+            mailboxes.extend(self._unwrap_list(res))
+        return mailboxes
 
     def check_billing(self) -> Optional[str]:
         """
-        Best-effort payment-hold detection from the org / stats endpoint.
+        Best-effort payment-hold detection from the reporting/organization data.
         Returns a descriptive string, or None if healthy / unknown.
-
-        TODO(after API key): point this at the real billing/orders/stats path.
         """
-        try:
-            result = self._request("GET", "/stats")
-        except Exception as exc:
-            logger.warning("ScaledMail: billing check failed: %s (non-fatal)", exc)
-            return None
-        self._detect_billing_status(result)
+        result = self._get_first_ok(["/stats", "/reporting-stats", "/organizations"])
+        if isinstance(result, (dict, list)):
+            for obj in (result if isinstance(result, list) else [result]):
+                if isinstance(obj, dict):
+                    self._detect_billing_status(obj)
         return self.workspace_billing_status
 
     def _detect_billing_status(self, response: dict) -> None:
@@ -172,16 +209,29 @@ class ScaledMailClient:
         status = str(mailbox.get("status", "")).lower()
         return status in ("suspended", "payment_pending", "past_due", "inactive", "disabled", "cancelled")
 
-    # ── Reconnect (stub) ─────────────────────────────────────────────────────
+    # ── Reconnect ───────────────────────────────────────────────────────────
 
     def reconnect_email(self, email: str, cached_mailbox: Optional[Dict] = None) -> tuple:
         """
-        NOT IMPLEMENTED — needs the full API docs (requires an API key).
+        NOT IMPLEMENTED — the public ScaledMail API has no documented endpoint to
+        re-push an *existing* mailbox to a sequencer.
+
+        The pieces that exist: POST /buy-pre-warm-inboxes accepts a `sequencer`
+        object — {provider, username, password, link, workspace, tag} — and uses
+        your sequencer login to push newly-bought inboxes. A "connect existing
+        mailboxes to sequencer" endpoint almost certainly exists internally
+        (their support does it during onboarding) but is not published.
+
+        To enable auto-reconnect: ask support@scaledmail.com for
+        "the API endpoint to (re-)push existing mailboxes for an organization to
+        our sequencer", then implement it here — likely a POST that takes the
+        same `sequencer` object plus a mailbox id / email list.
+
         Returns (success=False, permanent_failure=False) so the caller falls
         back to alert-only handling.
         """
         logger.info(
-            "ScaledMail: auto-reconnect not implemented yet for %s — alert-only. "
-            "Provide an API key to enable this.", email,
+            "ScaledMail: no public reconnect endpoint — %s stays alert-only. "
+            "See reconnect_email() docstring.", email,
         )
         return False, False

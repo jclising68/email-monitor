@@ -107,7 +107,7 @@ class Config:
             "PREMIUMINBOX_API_TOKEN", required=False, default=""
         )
         self.premiuminbox_api_base_url: str = get_env(
-            "PREMIUMINBOX_API_BASE_URL", required=False, default="https://portal.premiuminboxes.com/api/client"
+            "PREMIUMINBOX_API_BASE_URL", required=False, default="https://api.premiuminboxes.com/api"
         )
 
         # ScaledMail API — one global key; per-workspace org IDs come from the
@@ -115,7 +115,7 @@ class Config:
         # 'Settings' tab; env var is a fallback.
         self.scaledmail_api_key: str = get_env("SCALEDMAIL_API_KEY", required=False, default="")
         self.scaledmail_api_base_url: str = get_env(
-            "SCALEDMAIL_API_BASE_URL", required=False, default="https://api.scaledmail.com/api/v1"
+            "SCALEDMAIL_API_BASE_URL", required=False, default="https://server.scaledmail.com/api/v1"
         )
 
         # Health score thresholds (from warmup analytics)
