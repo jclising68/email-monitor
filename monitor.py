@@ -1750,26 +1750,31 @@ def _handle_infra_provider_disconnect(
     cfg: Config,
 ) -> None:
     """
-    Disconnect handling for the inbox-infrastructure providers whose auto-reconnect
-    is not implemented yet (Premium Inboxes, ScaledMail).
+    Disconnect handling for the inbox-infrastructure providers whose public API
+    has no reconnect endpoint (Premium Inboxes, ScaledMail).
 
-    PHASE 1 behaviour — modelled on the "no client / max attempts" tail of
-    _handle_zapmail_disconnect:
-      - If a billing/subscription issue is detected, skip everything else and
-        report a payment problem.
+    What their API IS used for here:
+      - Billing / payment-hold detection — a lapsed subscription silently kills
+        every mailbox for that client, so catching it early is the main value.
+      - Provider attribution — so the Slack alert says "reconnect in ScaledMail"
+        (the right place) instead of a generic message.
+
+    Behaviour:
+      - Billing/subscription issue detected -> report a payment problem, skip.
       - Otherwise alert once (re-alert honours cfg.zapmail_realert_hours) and
-        write alert_state so subsequent runs stay quiet until recovery.
+        write alert_state so later runs stay quiet until the account recovers.
       - Recovery is cleared by the connected-account branch at the top of run().
 
-    PHASE 2 (after API credentials): call provider_client.reconnect_email(email)
-    here with the pending / verify-next-run flow ZapMail uses.
+    PHASE 2 (if a vendor confirms a re-push endpoint — see each client's
+    reconnect_email docstring): call provider_client.reconnect_email(email) here
+    with the pending / verify-next-run flow ZapMail uses.
     """
     existing_row = alert_state.get(email)
     status_key = f"{provider}_disconnected"
 
     if billing_issue:
         logger.warning(
-            "%s billing issue for %s (%s): %s — skipping reconnect.",
+            "%s billing issue for %s (%s): %s",
             provider_label, email, ws_name, billing_issue,
         )
         new_row = build_new_alert_state_row(email, ws_name)
@@ -1785,16 +1790,10 @@ def _handle_infra_provider_disconnect(
         report.still_disconnected.append({
             "email": email, "workspace_name": ws_name,
             "provider": provider, "attempts": 0,
-            "reason": f"{provider_label} payment pending — {billing_issue}",
+            "reason": f"{provider_label} billing / payment hold — {billing_issue}. "
+                      f"Fix billing in {provider_label}; the mailboxes recover once it clears.",
         })
         return
-
-    # Phase 2 hook — currently a no-op stub that returns (False, False).
-    if provider_client is not None:
-        try:
-            provider_client.reconnect_email(email)
-        except Exception as exc:
-            logger.warning("%s reconnect_email raised for %s: %s (ignored)", provider_label, email, exc)
 
     is_new      = is_new_disconnection(email, alert_state)
     should_real = should_realert(email, alert_state, cfg.zapmail_realert_hours)
@@ -1815,7 +1814,8 @@ def _handle_infra_provider_disconnect(
     report.still_disconnected.append({
         "email": email, "workspace_name": ws_name,
         "provider": provider, "attempts": 0,
-        "reason": f"{provider_label} account — reconnect in the {provider_label} dashboard",
+        "reason": f"{provider_label} mailbox down — reconnect it in {provider_label} "
+                  f"(this provider has no auto-reconnect API)",
     })
 
 
