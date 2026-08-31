@@ -373,9 +373,9 @@ columns blank.
 Two kinds of message: a daily summary, and alerts whenever something needs a
 person.
 
-**The daily summary.** Once a day (around midday) a full status post: every
-client, how many of their mailboxes are connected / warming up / disconnected,
-and any domain-setup problems. Below that, only the things that need attention —
+**The daily summary** (*Email Deliverability Monitor — Daily Report*). Once a day
+(around midday) a full status post: every client, how many of their mailboxes are
+connected / warming up / disconnected, and any domain-setup problems. Below that, only the things that need attention —
 accounts still down, campaigns that got paused, sending limits pulled back,
 missing signatures. If a section isn't in the post, there's nothing wrong there.
 

@@ -102,9 +102,9 @@ class SlackReporter:
         detected = _now_pht()
         provider_label = provider
         if reconnect_attempted:
-            action = f":warning: Auto-reconnect via {provider_label} API failed. Log in to Instantly and reconnect manually."
+            action = f":warning: Auto-reconnect via {provider_label} API failed. Reconnect this mailbox manually in {provider_label} (or the sending tool)."
         else:
-            action = ":warning: Log in to Instantly and reconnect manually."
+            action = f":warning: Reconnect this mailbox manually in {provider_label} (or the sending tool)."
         text = (
             f":rotating_light: *{provider_label} Account Disconnected*\n"
             f"*Account:* {email}\n"
@@ -328,7 +328,7 @@ class SlackReporter:
                 prev = item.get("previous_limit")
                 new = item.get("new_limit")
                 ok = item.get("success", True)
-                tag = "" if ok else " :x: _(update failed — adjust manually in Instantly)_"
+                tag = "" if ok else " :x: _(update failed — adjust manually in the sending tool)_"
                 lines.append(f"  • {item['email']} — {prev} → {new}{tag}")
         lines.append("")
         lines.append(f":information_source: _Auto-adjusted to keep sending volume at or below {max_limit}/day._")
@@ -488,7 +488,7 @@ class ReportData:
 def _format_daily_report(r: ReportData) -> str:
     lines: List[str] = []
 
-    lines.append(":bar_chart: *Instantly Email Monitor — Daily Report*")
+    lines.append(":bar_chart: *Email Deliverability Monitor — Daily Report*")
     lines.append(f":calendar: {r.generated_at}")
     lines.append("")
 
@@ -724,7 +724,7 @@ def _format_weekly_domain_report(r: ReportData) -> str:
     """Format the weekly domain health report."""
     lines: List[str] = []
 
-    lines.append(":globe_with_meridians: *Instantly Email Monitor — Weekly Domain Health Report*")
+    lines.append(":globe_with_meridians: *Email Deliverability Monitor — Weekly Domain Health Report*")
     lines.append(f":calendar: {r.generated_at}")
     lines.append("")
 
