@@ -90,6 +90,11 @@ TAB_SETTINGS    = "Settings"      # client-editable credential store (created + 
 _AS_COLS       = ["email", "workspace_name", "first_detected", "last_alerted", "reconnect_attempts", "status"]
 _META_COLS     = ["key", "value"]
 _SETTINGS_COLS = ["key", "value", "notes"]
+_WS_COLS       = [
+    "workspace_name", "active", "api_key", "lemlist_api_key", "smartlead_api_key",
+    "zapmail_workspace_key_google", "zapmail_workspace_key_microsoft",
+    "mission_inbox_api_key", "premiuminbox_workspace_id", "scaledmail_organization_id",
+]
 
 # Rows seeded into the 'Settings' tab on first run so a non-technical client sees
 # the full menu of what they can fill in. Blank 'value' → fall back to the env
@@ -166,6 +171,32 @@ class SheetsClient:
                         ws = self._open().add_worksheet(title=tab, rows=100, cols=len(_SETTINGS_COLS))
                         ws.append_row(_SETTINGS_COLS)
                         ws.append_rows([[key, "", note] for key, note in _SETTINGS_SEED])
+                        return ws
+                    if tab == TAB_WORKSPACES:
+                        ss = self._open()
+                        # A very common mistake: the client list is filled in but the
+                        # tab is still called "Sheet1". If any tab already holds the
+                        # workspace_name header, just rename that one.
+                        for other in ss.worksheets():
+                            if other.title in (TAB_SETTINGS, TAB_ALERT_STATE, TAB_META):
+                                continue
+                            try:
+                                header = [str(h).strip().lower() for h in other.row_values(1)]
+                            except Exception:
+                                header = []
+                            if "workspace_name" in header:
+                                logger.warning(
+                                    "Tab '%s' has the workspace headers but isn't named '%s' — renaming it.",
+                                    other.title, TAB_WORKSPACES,
+                                )
+                                other.update_title(TAB_WORKSPACES)
+                                return other
+                        logger.warning(
+                            "Creating an empty '%s' tab — add one row per client (see the guide).",
+                            TAB_WORKSPACES,
+                        )
+                        ws = ss.add_worksheet(title=TAB_WORKSPACES, rows=200, cols=len(_WS_COLS))
+                        ws.append_row(_WS_COLS)
                         return ws
                     raise
             except gspread.exceptions.WorksheetNotFound:

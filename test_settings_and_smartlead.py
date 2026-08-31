@@ -95,6 +95,41 @@ def test_auth_routing() -> None:
               "no service account -> OAuth fallback")
 
 
+# ── Workspaces tab auto-recovery (wrong tab name) ───────────────────────────
+
+def test_workspaces_tab_autoname() -> None:
+    import gspread
+    from sheets_client import SheetsClient
+
+    # A "Sheet1" tab already holds the workspace headers -> rename it.
+    sc = SheetsClient.__new__(SheetsClient)
+    sheet1 = MagicMock(); sheet1.title = "Sheet1"
+    sheet1.row_values.return_value = ["workspace_name", "active", "api_key"]
+    settings = MagicMock(); settings.title = "Settings"
+    ss = MagicMock()
+    ss.worksheet.side_effect = gspread.exceptions.WorksheetNotFound
+    ss.worksheets.return_value = [sheet1, settings]
+    sc._open = lambda: ss
+    sc._spreadsheet = ss
+    out = sc._worksheet("Workspaces")
+    check(out is sheet1 and sheet1.update_title.call_args[0] == ("Workspaces",),
+          "a mis-named tab with workspace headers is renamed to 'Workspaces'")
+
+    # No tab has the headers -> create an empty Workspaces with a header row.
+    sc2 = SheetsClient.__new__(SheetsClient)
+    other = MagicMock(); other.title = "Notes"; other.row_values.return_value = ["a", "b"]
+    ss2 = MagicMock()
+    ss2.worksheet.side_effect = gspread.exceptions.WorksheetNotFound
+    ss2.worksheets.return_value = [other]
+    created = MagicMock()
+    ss2.add_worksheet.return_value = created
+    sc2._open = lambda: ss2
+    sc2._spreadsheet = ss2
+    out2 = sc2._worksheet("Workspaces")
+    check(out2 is created and created.append_row.called,
+          "no matching tab -> empty 'Workspaces' tab is created with headers")
+
+
 # ── SmartleadClient classification ───────────────────────────────────────────
 
 def test_smartlead_classifiers() -> None:
@@ -177,6 +212,7 @@ def test_process_smartlead_workspace() -> None:
 
 def main() -> int:
     for fn in (test_apply_overrides, test_get_settings, test_auth_routing,
+               test_workspaces_tab_autoname,
                test_smartlead_classifiers, test_process_smartlead_workspace):
         print(f"\n--- {fn.__name__} ---")
         try:
