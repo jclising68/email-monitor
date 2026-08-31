@@ -73,6 +73,28 @@ def test_get_settings() -> None:
     check(len(_SETTINGS_SEED) == 4, "seed list has the 4 credential keys")
 
 
+# ── SheetsClient auth routing (service account vs OAuth fallback) ─────────────
+
+def test_auth_routing() -> None:
+    from unittest.mock import patch
+    import sheets_client
+
+    sa = {"type": "service_account", "client_email": "bot@p.iam.gserviceaccount.com"}
+    with patch.object(sheets_client, "ServiceAccountCredentials") as SA, \
+         patch.object(sheets_client, "gspread"), \
+         patch.object(sheets_client, "_get_oauth_credentials") as oauth:
+        sheets_client.SheetsClient(sa, "sheetid")
+        check(SA.from_service_account_info.called and not oauth.called,
+              "service-account key routes to service-account auth")
+
+    with patch.object(sheets_client, "ServiceAccountCredentials") as SA, \
+         patch.object(sheets_client, "gspread"), \
+         patch.object(sheets_client, "_get_oauth_credentials") as oauth:
+        sheets_client.SheetsClient({}, "sheetid")
+        check(oauth.called and not SA.from_service_account_info.called,
+              "no service account -> OAuth fallback")
+
+
 # ── SmartleadClient classification ───────────────────────────────────────────
 
 def test_smartlead_classifiers() -> None:
@@ -154,8 +176,8 @@ def test_process_smartlead_workspace() -> None:
 
 
 def main() -> int:
-    for fn in (test_apply_overrides, test_get_settings, test_smartlead_classifiers,
-               test_process_smartlead_workspace):
+    for fn in (test_apply_overrides, test_get_settings, test_auth_routing,
+               test_smartlead_classifiers, test_process_smartlead_workspace):
         print(f"\n--- {fn.__name__} ---")
         try:
             fn()
