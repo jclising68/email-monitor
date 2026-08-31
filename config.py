@@ -46,8 +46,21 @@ def load_google_credentials() -> dict:
 
 
 class Config:
+    # Credential-type settings that may be supplied from the Sheet's "Settings" tab.
+    # apply_overrides() maps these keys onto the matching attribute below.
+    # (Tuning thresholds are intentionally NOT here — they stay as code defaults.)
+    _SHEET_OVERRIDABLE = (
+        "slack_webhook_url",
+        "zapmail_api_key",
+        "premiuminbox_api_token",
+        "scaledmail_api_key",
+    )
+
     def __init__(self):
-        self.slack_webhook_url: str = get_env("SLACK_WEBHOOK_URL")
+        # SLACK_WEBHOOK_URL is optional at the env layer — it can instead be
+        # supplied from the Sheet's "Settings" tab (see apply_overrides). run()
+        # exits cleanly if neither source provides it.
+        self.slack_webhook_url: str = get_env("SLACK_WEBHOOK_URL", required=False, default="")
         self.google_sheets_id: str = get_env("GOOGLE_SHEETS_ID")
         self.google_credentials: dict = load_google_credentials()
         self.log_level: str = get_env("LOG_LEVEL", required=False, default="INFO").upper()
@@ -71,6 +84,24 @@ class Config:
         self.zapmail_api_key: str = get_env("ZAPMAIL_API_KEY", required=False, default="")
         self.zapmail_api_base_url: str = get_env(
             "ZAPMAIL_API_BASE_URL", required=False, default="https://api.zapmail.ai/api"
+        )
+
+        # Premium Inboxes API — one global token; per-workspace IDs come from the
+        # 'premiuminbox_workspace_id' sheet column. Normally supplied via the Sheet
+        # 'Settings' tab; env var is a fallback.
+        self.premiuminbox_api_token: str = get_env(
+            "PREMIUMINBOX_API_TOKEN", required=False, default=""
+        )
+        self.premiuminbox_api_base_url: str = get_env(
+            "PREMIUMINBOX_API_BASE_URL", required=False, default="https://portal.premiuminboxes.com/api/client"
+        )
+
+        # ScaledMail API — one global key; per-workspace org IDs come from the
+        # 'scaledmail_organization_id' sheet column. Normally supplied via the Sheet
+        # 'Settings' tab; env var is a fallback.
+        self.scaledmail_api_key: str = get_env("SCALEDMAIL_API_KEY", required=False, default="")
+        self.scaledmail_api_base_url: str = get_env(
+            "SCALEDMAIL_API_BASE_URL", required=False, default="https://api.scaledmail.com/api/v1"
         )
 
         # Health score thresholds (from warmup analytics)
@@ -120,6 +151,25 @@ class Config:
         self.provider_error_realert_hours: int = int(
             get_env("PROVIDER_ERROR_REALERT_HOURS", required=False, default="24")
         )
+
+    def apply_overrides(self, settings: dict) -> None:
+        """
+        Overlay credential-type settings read from the Sheet's 'Settings' tab.
+
+        Precedence: a non-empty Sheet value wins over the env var / secret, which
+        in turn wins over the code default. Only keys in _SHEET_OVERRIDABLE are
+        honoured — tuning thresholds are never Sheet-driven.
+
+        Mutates attributes in place so callers holding a reference to this Config
+        (including monitor.py's crash handler) see the resolved values.
+        """
+        if not settings:
+            return
+        for key in self._SHEET_OVERRIDABLE:
+            value = str(settings.get(key, "") or "").strip()
+            if value:
+                setattr(self, key, value)
+                logger.info("Config: '%s' overridden from Sheet 'Settings' tab.", key)
 
     def configure_logging(self):
         logging.basicConfig(
