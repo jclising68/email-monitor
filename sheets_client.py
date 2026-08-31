@@ -1,6 +1,11 @@
 """
-sheets_client.py — Read workspaces/accounts/alert_state from Google Sheets;
-                   write back alert_state rows.
+sheets_client.py — Read Workspaces/Settings from Google Sheets; read/write
+                   alert_state and meta.
+
+Auth: a Google *service account* if one is configured (see config.load_google_
+credentials — GOOGLE_CREDENTIALS_JSON / _B64 / _FILE); the Sheet is shared with
+the service account's email. Otherwise falls back to OAuth user auth
+(credentials.json + token.json / GOOGLE_TOKEN_JSON_B64).
 
 Tab names (case-sensitive):
   Workspaces  : workspace_name | active | api_key | lemlist_api_key | smartlead_api_key |
@@ -22,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -103,11 +108,25 @@ _SETTINGS_SEED = [
 class SheetsClient:
     def __init__(self, credentials_dict: dict, sheet_id: str):
         """
-        credentials_dict is accepted for API compatibility but ignored —
-        authentication uses OAuth2 via credentials.json / token.json.
+        Two auth paths:
+          - Service account (preferred, client-friendly): if credentials_dict is
+            a parsed service-account key ({"type": "service_account", ...}), use
+            it directly. The Sheet must be shared with the service account's
+            client_email. No browser, no token refresh, no per-user setup.
+          - OAuth user auth (legacy): if no service account is configured, fall
+            back to credentials.json + token.json (GOOGLE_TOKEN_JSON_B64 in CI).
         """
         self._sheet_id = sheet_id
-        creds = _get_oauth_credentials()
+        if isinstance(credentials_dict, dict) and credentials_dict.get("type") == "service_account":
+            logger.info(
+                "Google auth: service account (%s)", credentials_dict.get("client_email", "?"),
+            )
+            creds = ServiceAccountCredentials.from_service_account_info(
+                credentials_dict, scopes=SCOPES,
+            )
+        else:
+            logger.info("Google auth: OAuth user token (no service account configured).")
+            creds = _get_oauth_credentials()
         self._gc = gspread.authorize(creds)
         self._spreadsheet = None  # lazy open
 

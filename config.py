@@ -21,11 +21,25 @@ def get_env(key: str, required: bool = True, default: str = None) -> str:
 
 def load_google_credentials() -> dict:
     """
-    Returns parsed Google service account JSON.
-    Supports two forms:
-      - GOOGLE_CREDENTIALS_JSON_B64: base64-encoded JSON (Railway-friendly)
+    Returns the parsed Google *service account* key JSON, if one is configured.
+
+    A service account is the client-friendly path: create it once, share the
+    Google Sheet with its email address, and no browser consent / token refresh
+    is ever needed. Supports three forms (checked in order):
+      - GOOGLE_CREDENTIALS_JSON     : the raw JSON, pasted straight into a secret
+      - GOOGLE_CREDENTIALS_JSON_B64 : base64-encoded JSON
       - GOOGLE_CREDENTIALS_JSON_FILE: path to a local JSON file
+
+    Returns {} when none is set — sheets_client then falls back to the older
+    OAuth user-auth flow (credentials.json + token.json).
     """
+    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if raw and raw.strip():
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            raise EnvironmentError(f"GOOGLE_CREDENTIALS_JSON is not valid JSON: {e}")
+
     b64 = os.environ.get("GOOGLE_CREDENTIALS_JSON_B64")
     if b64:
         try:

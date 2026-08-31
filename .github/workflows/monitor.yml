@@ -37,8 +37,13 @@ jobs:
 
       - name: Run monitor
         env:
-          # Required — these two bootstrap reading the Sheet and cannot live in it.
+          # Required — which Sheet, and how to authenticate to it. These bootstrap
+          # reading the Sheet and cannot live in it.
           GOOGLE_SHEETS_ID:         ${{ secrets.GOOGLE_SHEETS_ID }}
+          # Preferred: a service-account key JSON, pasted raw into this secret.
+          # Share the Sheet with the service account's email (Editor).
+          GOOGLE_CREDENTIALS_JSON:  ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # Legacy fallback: OAuth user token (base64). Only one of these is needed.
           GOOGLE_TOKEN_JSON_B64:    ${{ secrets.GOOGLE_TOKEN_JSON_B64 }}
           # Optional fallbacks — normally supplied from the Sheet's "Settings" tab.
           # Keep SLACK_WEBHOOK_URL set as a secret so crash alerts still fire if
