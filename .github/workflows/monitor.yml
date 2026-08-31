@@ -37,17 +37,17 @@ jobs:
 
       - name: Run monitor
         env:
-          SLACK_WEBHOOK_URL:        ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Required — these two bootstrap reading the Sheet and cannot live in it.
           GOOGLE_SHEETS_ID:         ${{ secrets.GOOGLE_SHEETS_ID }}
           GOOGLE_TOKEN_JSON_B64:    ${{ secrets.GOOGLE_TOKEN_JSON_B64 }}
+          # Optional fallbacks — normally supplied from the Sheet's "Settings" tab.
+          # Keep SLACK_WEBHOOK_URL set as a secret so crash alerts still fire if
+          # the Sheet is ever unreadable; the Sheet value wins when present.
+          SLACK_WEBHOOK_URL:        ${{ secrets.SLACK_WEBHOOK_URL }}
           ZAPMAIL_API_KEY:          ${{ secrets.ZAPMAIL_API_KEY }}
-          MAX_RECONNECT_ATTEMPTS:   '5'
-          ZAPMAIL_REALERT_HOURS:    '0'
-          HEALTH_SCORE_ALERT_THRESHOLD: '80'
-          HEALTH_SCORE_CRITICAL_THRESHOLD: '60'
-          SPAM_RATE_ALERT_THRESHOLD: '10'
-          BOUNCE_RATE_ALERT_THRESHOLD: '5'
-          DAILY_LIMIT_MAX:          '30'
+          PREMIUMINBOX_API_TOKEN:   ${{ secrets.PREMIUMINBOX_API_TOKEN }}
+          SCALEDMAIL_API_KEY:       ${{ secrets.SCALEDMAIL_API_KEY }}
+          # Tuning thresholds are code defaults now (config.py) — not set here.
           LOG_LEVEL:                'INFO'
         run: |
           SCHEDULE="${{ github.event.schedule }}"

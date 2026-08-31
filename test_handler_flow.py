@@ -31,6 +31,10 @@ class FakeConfig:
     zapmail_realert_hours = 0
     zapmail_api_key = ""
     zapmail_api_base_url = "https://api.zapmail.ai/api"
+    premiuminbox_api_token = ""
+    premiuminbox_api_base_url = "https://portal.premiuminboxes.com/api/client"
+    scaledmail_api_key = ""
+    scaledmail_api_base_url = "https://api.scaledmail.com/api/v1"
     health_score_alert_threshold = 80
     health_score_critical_threshold = 60
     health_score_grace_days = 7
@@ -44,6 +48,13 @@ class FakeConfig:
     def configure_logging(self):
         import logging
         logging.basicConfig(level=logging.WARNING)
+
+    def apply_overrides(self, settings):
+        for key in ("slack_webhook_url", "zapmail_api_key",
+                    "premiuminbox_api_token", "scaledmail_api_key"):
+            val = str((settings or {}).get(key, "") or "").strip()
+            if val:
+                setattr(self, key, val)
 
 
 # Monkey-patch config before importing monitor

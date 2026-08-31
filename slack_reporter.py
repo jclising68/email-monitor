@@ -397,7 +397,7 @@ class SlackReporter:
 class WorkspaceSummary:
     def __init__(self, name: str, tool: str = "instantly"):
         self.name = name
-        self.tool = tool   # "instantly" or "lemlist"
+        self.tool = tool   # "instantly" | "lemlist" | "smartlead"
         self.connected: int = 0
         self.warmup: int = 0
         self.paused: int = 0
@@ -459,7 +459,7 @@ class ReportData:
 
     @property
     def total_workspaces(self) -> int:
-        # Count unique base workspace names (strips "[Instantly]" / "[Lemlist]" suffixes)
+        # Count unique base workspace names (strips "[Instantly]" / "[Lemlist]" / "[Smartlead]" suffixes)
         return len({w.name.split(" [")[0] for w in self.workspace_summaries})
 
     @property
@@ -498,7 +498,7 @@ def _format_daily_report(r: ReportData) -> str:
         max_name_len = max(len(w.name) for w in r.workspace_summaries)
         for w in sorted(r.workspace_summaries, key=lambda x: x.name):
             pad = max_name_len - len(w.name)
-            if w.tool == "lemlist":
+            if w.tool in ("lemlist", "smartlead"):
                 parts = [f"{w.connected} connected"]
                 parts.append(f"{w.disconnected} disconnected")
             else:
@@ -536,7 +536,9 @@ def _format_daily_report(r: ReportData) -> str:
     lines.append("")
     if r.reconnected:
         lines.append(":white_check_mark: *Auto-Reconnected*")
-        _PROVIDER_LABELS = {"zapmail": "ZapMail", "missioninbox": "Mission Inbox"}
+        _PROVIDER_LABELS = {"zapmail": "ZapMail", "missioninbox": "Mission Inbox",
+                            "premiuminbox": "Premium Inboxes", "scaledmail": "ScaledMail",
+                            "smartlead": "Smartlead"}
         for item in r.reconnected:
             provider = item.get("provider", "")
             label = _PROVIDER_LABELS.get(provider, provider.title())
@@ -554,12 +556,15 @@ def _format_daily_report(r: ReportData) -> str:
             provider = item.get("provider", "unknown")
             attempts = item.get("attempts", 0)
             reason = item.get("reason", "")
-            label = {"zapmail": "ZapMail", "missioninbox": "Mission Inbox", "client": "Client account"}.get(provider, "")
+            label = {"zapmail": "ZapMail", "missioninbox": "Mission Inbox", "client": "Client account",
+                     "premiuminbox": "Premium Inboxes", "scaledmail": "ScaledMail"}.get(provider, "")
             if reason:
                 # Specific reason (e.g. payment pending) — show directly
                 note = reason
             elif provider == "lemlist":
                 note = "Lemlist account — reconnect manually in Lemlist dashboard"
+            elif provider == "smartlead":
+                note = "Smartlead account — reconnect manually in Smartlead dashboard"
             elif provider == "client":
                 note = "Client account — notify client to reconnect in Instantly"
             elif provider in ("zapmail", "missioninbox") and attempts == 0:

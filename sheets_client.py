@@ -3,16 +3,17 @@ sheets_client.py — Read workspaces/accounts/alert_state from Google Sheets;
                    write back alert_state rows.
 
 Tab names (case-sensitive):
-  workspaces  : workspace_name | api_key | active
-                [extras ignored: any extra columns]
-  accounts    : Email | First Name | Last Name |
-                IMAP Username | IMAP Password | IMAP Host | IMAP Port |
-                SMTP Username | SMTP Password | SMTP Host | SMTP Port |
-                [extras ignored: Daily Limit, Warmup Enabled, etc.]
+  Workspaces  : workspace_name | active | api_key | lemlist_api_key | smartlead_api_key |
+                zapmail_workspace_key_google | zapmail_workspace_key_microsoft |
+                mission_inbox_api_key | premiuminbox_workspace_id | scaledmail_organization_id
+                (only workspace_name + active + one sending key are required)
+  Settings    : key | value | notes   ← client-editable credential store,
+                created + seeded automatically on first run
   alert_state : email | workspace_name | first_detected | last_alerted |
                 reconnect_attempts | status   ← managed automatically
+  meta        : key | value   ← report idempotency flags, managed automatically
 
-ZapMail mailboxes are discovered live from the ZapMail API — no sheet tab needed.
+Mailboxes are discovered live from each provider's API — no sheet tab needed.
 """
 from __future__ import annotations
 
@@ -79,9 +80,25 @@ def _get_oauth_credentials() -> OAuthCredentials:
 TAB_WORKSPACES  = "Workspaces"
 TAB_ALERT_STATE = "alert_state"   # created automatically on first run (lowercase is fine)
 TAB_META        = "meta"          # small key/value store for idempotency flags
+TAB_SETTINGS    = "Settings"      # client-editable credential store (created + seeded on first run)
 
-_AS_COLS   = ["email", "workspace_name", "first_detected", "last_alerted", "reconnect_attempts", "status"]
-_META_COLS = ["key", "value"]
+_AS_COLS       = ["email", "workspace_name", "first_detected", "last_alerted", "reconnect_attempts", "status"]
+_META_COLS     = ["key", "value"]
+_SETTINGS_COLS = ["key", "value", "notes"]
+
+# Rows seeded into the 'Settings' tab on first run so a non-technical client sees
+# the full menu of what they can fill in. Blank 'value' → fall back to the env
+# var / secret, then to the code default. Only credential-type keys live here.
+_SETTINGS_SEED = [
+    ("slack_webhook_url",
+     "REQUIRED — Slack Incoming Webhook URL. Create at api.slack.com/apps -> your app -> Incoming Webhooks."),
+    ("zapmail_api_key",
+     "Optional — ZapMail API key (global). Only if using ZapMail. app.zapmail.ai -> Settings -> API Keys."),
+    ("premiuminbox_api_token",
+     "Optional — Premium Inboxes API token (global). Only if using Premium Inboxes. portal.premiuminboxes.com -> Settings -> API Token."),
+    ("scaledmail_api_key",
+     "Optional — ScaledMail API key (global). Only if using ScaledMail. app.scaledmail.com/settings."),
+]
 
 class SheetsClient:
     def __init__(self, credentials_dict: dict, sheet_id: str):
@@ -124,6 +141,13 @@ class SheetsClient:
                         ws = self._open().add_worksheet(title=tab, rows=100, cols=len(_META_COLS))
                         ws.append_row(_META_COLS)
                         return ws
+                    if tab == TAB_SETTINGS:
+                        logger.info("Creating missing '%s' tab in Google Sheet (seeding %d rows).",
+                                    tab, len(_SETTINGS_SEED))
+                        ws = self._open().add_worksheet(title=tab, rows=100, cols=len(_SETTINGS_COLS))
+                        ws.append_row(_SETTINGS_COLS)
+                        ws.append_rows([[key, "", note] for key, note in _SETTINGS_SEED])
+                        return ws
                     raise
             except gspread.exceptions.WorksheetNotFound:
                 raise
@@ -138,9 +162,12 @@ class SheetsClient:
         """
         Return list of active workspace dicts.
         Required columns : workspace_name, active
-        Optional columns : api_key (Instantly), lemlist_api_key, zapmail_workspace_key_google,
-                           zapmail_workspace_key_microsoft, mission_inbox_api_key
-        A workspace with only lemlist_api_key (no Instantly api_key) is valid.
+        Optional columns : api_key (Instantly), lemlist_api_key, smartlead_api_key,
+                           zapmail_workspace_key_google, zapmail_workspace_key_microsoft,
+                           mission_inbox_api_key, premiuminbox_workspace_id,
+                           scaledmail_organization_id
+        A workspace is valid if it has at least one sending-platform key:
+        api_key (Instantly) OR lemlist_api_key OR smartlead_api_key.
         """
         ws = self._worksheet(TAB_WORKSPACES)
         rows = ws.get_all_records()  # no expected_headers — extra cols are optional
@@ -154,7 +181,8 @@ class SheetsClient:
             ws_name = str(row.get("workspace_name", "")).strip()
             api_key = str(row.get("api_key", "")).strip()
             lemlist_api_key = str(row.get("lemlist_api_key", "")).strip()
-            if not ws_name or (not api_key and not lemlist_api_key):
+            smartlead_api_key = str(row.get("smartlead_api_key", "")).strip()
+            if not ws_name or not (api_key or lemlist_api_key or smartlead_api_key):
                 logger.warning("Skipping workspace row with missing name or all api keys: %s", row)
                 continue
             result.append({
@@ -166,10 +194,45 @@ class SheetsClient:
                 # Optional Mission Inbox API key — empty string if not present
                 "mission_inbox_api_key":    str(row.get("mission_inbox_api_key", "")).strip(),
                 # Optional Lemlist API key — empty string if not present
-                "lemlist_api_key":          str(row.get("lemlist_api_key", "")).strip(),
+                "lemlist_api_key":          lemlist_api_key,
+                # Optional Smartlead API key — empty string if not present
+                "smartlead_api_key":        smartlead_api_key,
+                # Optional inbox-infrastructure provider IDs — empty string if not present
+                "premiuminbox_workspace_id":   str(row.get("premiuminbox_workspace_id", "")).strip(),
+                "scaledmail_organization_id":  str(row.get("scaledmail_organization_id", "")).strip(),
             })
         logger.debug("Loaded %d active workspace(s) from Sheets.", len(result))
         return result
+
+    def get_settings(self) -> Dict[str, str]:
+        """
+        Return the client-editable 'Settings' tab as a dict of {key: value}, for
+        non-empty values only. Auto-creates + seeds the tab if missing, and
+        appends any seed rows a client may have deleted so the menu stays complete.
+
+        Never raises for a missing/blank tab — returns {} so the caller falls
+        back to env vars / defaults.
+        """
+        ws = self._worksheet(TAB_SETTINGS)
+        if not ws.row_values(1):
+            ws.append_row(_SETTINGS_COLS)
+            ws.append_rows([[key, "", note] for key, note in _SETTINGS_SEED])
+            return {}
+
+        rows = ws.get_all_records(expected_headers=_SETTINGS_COLS)
+        present_keys = {str(r.get("key", "")).strip() for r in rows}
+        missing = [[key, "", note] for key, note in _SETTINGS_SEED if key not in present_keys]
+        if missing:
+            ws.append_rows(missing)
+
+        settings: Dict[str, str] = {}
+        for row in rows:
+            key = str(row.get("key", "")).strip()
+            val = str(row.get("value", "")).strip()
+            if key and val:
+                settings[key] = val
+        logger.debug("Loaded %d non-empty setting(s) from Sheets.", len(settings))
+        return settings
 
     def get_alert_state(self) -> Dict[str, Dict]:
         """

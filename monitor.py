@@ -30,9 +30,12 @@ except EnvironmentError as _env_err:
 from instantly_client import InstantlyClient, InstantlyAPIError
 from lemlist_client import LemlistClient
 from missioninbox_client import MissionInboxClient
+from premiuminbox_client import PremiumInboxClient
 from reconnect import attempt_reconnect, attempt_post_only
+from scaledmail_client import ScaledMailClient
 from sheets_client import SheetsClient
 from slack_reporter import SlackReporter, ReportData, WorkspaceSummary
+from smartlead_client import SmartleadClient
 from state import (
     is_new_disconnection,
     should_realert,
@@ -49,6 +52,25 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
     logger.info("=== Email Monitor starting (report=%s, weekly=%s) ===", send_report, send_weekly_report)
 
     sheets = SheetsClient(_cfg.google_credentials, _cfg.google_sheets_id)
+
+    # ── Resolve credentials from the Sheet's 'Settings' tab ───────────────────
+    # A non-empty Sheet value wins over the env var / secret. This is how a
+    # non-technical client configures the system: paste a webhook / API key into
+    # a cell, no code or GitHub-secret changes needed.
+    try:
+        _cfg.apply_overrides(sheets.get_settings())
+    except Exception as exc:
+        logger.warning(
+            "Could not read the 'Settings' tab (%s) — falling back to env vars / defaults.", exc,
+        )
+
+    if not _cfg.slack_webhook_url:
+        logger.critical(
+            "No Slack webhook configured. Add it to the Google Sheet 'Settings' tab "
+            "(row 'slack_webhook_url'), or set the SLACK_WEBHOOK_URL secret."
+        )
+        sys.exit(1)
+
     slack  = SlackReporter(_cfg.slack_webhook_url)
     report = ReportData()
 
@@ -85,12 +107,15 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
         api_key  = ws["api_key"]
         logger.info("Processing workspace: %s", ws_name)
 
-        # Workspaces that only use Lemlist (no Instantly api_key) skip Instantly
-        # processing entirely and go straight to Lemlist at the bottom of the loop.
+        # Workspaces with no Instantly api_key skip Instantly processing entirely
+        # and are handled by their sending-platform processor(s) directly.
         if not api_key:
-            lemlist_api_key = ws.get("lemlist_api_key", "")
+            lemlist_api_key   = ws.get("lemlist_api_key", "")
+            smartlead_api_key = ws.get("smartlead_api_key", "")
             if lemlist_api_key:
                 _process_lemlist_workspace(ws_name, lemlist_api_key, report, sheets, alert_state, _cfg)
+            if smartlead_api_key:
+                _process_smartlead_workspace(ws_name, smartlead_api_key, report, sheets, alert_state, _cfg)
             continue
 
         client  = InstantlyClient(api_key, base_url=_cfg.instantly_base_url)
@@ -208,6 +233,56 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     "MissionInbox: failed to list mailboxes for workspace '%s' (%s) — "
                     "MI email set empty but client kept for individual lookups.", ws_name, exc,
                 )
+
+        # Build a Premium Inboxes client if a global token + workspace id are set.
+        # PHASE 1: used for disconnection alerting + billing detection only —
+        # auto-reconnect is not implemented yet (needs the portal API docs).
+        premiuminbox_client: Optional[PremiumInboxClient] = None
+        premiuminbox_email_set: set = set()
+        premiuminbox_billing_issue: Optional[str] = None
+        pi_ws_id = ws.get("premiuminbox_workspace_id", "")
+        if pi_ws_id and _cfg.premiuminbox_api_token:
+            premiuminbox_client = PremiumInboxClient(
+                api_token=_cfg.premiuminbox_api_token,
+                workspace_id=pi_ws_id,
+                base_url=_cfg.premiuminbox_api_base_url,
+            )
+            try:
+                pi_accounts = premiuminbox_client.list_email_accounts()
+                premiuminbox_email_set = {
+                    str(mb.get("email", "")).lower() for mb in pi_accounts if mb.get("email")
+                }
+                logger.info("PremiumInbox: workspace '%s' has %d mailbox(es).", ws_name, len(premiuminbox_email_set))
+                premiuminbox_billing_issue = (
+                    premiuminbox_client.check_subscription_status()
+                    or premiuminbox_client.workspace_billing_status
+                )
+            except Exception as exc:
+                logger.error("PremiumInbox: failed to list mailboxes for workspace '%s' (%s).", ws_name, exc)
+
+        # Build a ScaledMail client if a global key + organization id are set.
+        # PHASE 1: disconnection alerting + billing detection only.
+        scaledmail_client: Optional[ScaledMailClient] = None
+        scaledmail_email_set: set = set()
+        scaledmail_billing_issue: Optional[str] = None
+        sm_org_id = ws.get("scaledmail_organization_id", "")
+        if sm_org_id and _cfg.scaledmail_api_key:
+            scaledmail_client = ScaledMailClient(
+                api_key=_cfg.scaledmail_api_key,
+                organization_id=sm_org_id,
+                base_url=_cfg.scaledmail_api_base_url,
+            )
+            try:
+                sm_mailboxes = scaledmail_client.list_mailboxes()
+                scaledmail_email_set = {
+                    str(mb.get("email", "")).lower() for mb in sm_mailboxes if mb.get("email")
+                }
+                logger.info("ScaledMail: workspace '%s' has %d mailbox(es).", ws_name, len(scaledmail_email_set))
+                scaledmail_billing_issue = (
+                    scaledmail_client.check_billing() or scaledmail_client.workspace_billing_status
+                )
+            except Exception as exc:
+                logger.error("ScaledMail: failed to list mailboxes for workspace '%s' (%s).", ws_name, exc)
 
         try:
             accounts = client.get_all_accounts()
@@ -342,7 +417,10 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                     )
                     continue
 
-                provider = _resolve_provider(email, missioninbox_email_set, zapmail_email_set, missioninbox_client)
+                provider = _resolve_provider(
+                    email, missioninbox_email_set, zapmail_email_set, missioninbox_client,
+                    premiuminbox_email_set, scaledmail_email_set,
+                )
 
                 if provider == "missioninbox":
                     _handle_missioninbox_disconnect(
@@ -357,6 +435,18 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
                         zapmail_email_to_mailbox.get(email),
                         zapmail_billing_issue,
                         sheets, slack, alert_state, report, _cfg,
+                    )
+                elif provider == "premiuminbox":
+                    _handle_infra_provider_disconnect(
+                        "premiuminbox", "Premium Inboxes", premiuminbox_client,
+                        email, ws_name, premiuminbox_billing_issue,
+                        sheets, alert_state, report, _cfg,
+                    )
+                elif provider == "scaledmail":
+                    _handle_infra_provider_disconnect(
+                        "scaledmail", "ScaledMail", scaledmail_client,
+                        email, ws_name, scaledmail_billing_issue,
+                        sheets, alert_state, report, _cfg,
                     )
                 else:
                     is_new = is_new_disconnection(email, alert_state)
@@ -421,12 +511,16 @@ def run(send_report: bool = False, send_weekly_report: bool = False) -> None:
             if not str(_acct.get("signature") or "").strip():
                 report.signature_issues.append({"email": _email, "workspace_name": ws_name})
 
-        # ── Lemlist processing (if workspace has Lemlist configured) ──────────────
-        lemlist_api_key = ws.get("lemlist_api_key", "")
-        if lemlist_api_key:
+        # ── Lemlist / Smartlead processing (if also configured on this workspace) ──
+        lemlist_api_key   = ws.get("lemlist_api_key", "")
+        smartlead_api_key = ws.get("smartlead_api_key", "")
+        if lemlist_api_key or smartlead_api_key:
             # Rename Instantly summary so the tool is clear in the report
             summary.name = f"{ws_name} [Instantly]"
+        if lemlist_api_key:
             _process_lemlist_workspace(ws_name, lemlist_api_key, report, sheets, alert_state, _cfg)
+        if smartlead_api_key:
+            _process_smartlead_workspace(ws_name, smartlead_api_key, report, sheets, alert_state, _cfg)
 
         report.workspace_summaries.append(summary)
         logger.info(
@@ -527,6 +621,8 @@ def _resolve_provider(
     missioninbox_email_set: set,
     zapmail_email_set: set,
     missioninbox_client: Optional["MissionInboxClient"],
+    premiuminbox_email_set: Optional[set] = None,
+    scaledmail_email_set: Optional[set] = None,
 ) -> str:
     """
     Determine provider for a disconnected account.
@@ -567,6 +663,13 @@ def _resolve_provider(
     # 3. ZapMail
     if email in zapmail_email_set:
         return "zapmail"
+
+    # 4. Inbox-infrastructure providers (Premium Inboxes, ScaledMail) — detected
+    #    from their live mailbox lists, same as ZapMail.
+    if premiuminbox_email_set and email in premiuminbox_email_set:
+        return "premiuminbox"
+    if scaledmail_email_set and email in scaledmail_email_set:
+        return "scaledmail"
 
     return "unknown"
 
@@ -1003,6 +1106,225 @@ def _process_lemlist_campaign_health(
             })
 
 
+def _process_smartlead_workspace(
+    ws_name: str,
+    api_key: str,
+    report: ReportData,
+    sheets: SheetsClient,
+    alert_state: Dict,
+    cfg: "Config",
+) -> None:
+    """
+    Fetch and process all Smartlead email accounts for a workspace.
+
+    Connection status comes straight from the account payload
+    (`is_smtp_success`) — no live probe needed, unlike Lemlist.
+
+    Automated actions:
+      - Per-account daily send limit capped at cfg.daily_limit_max.
+      - Campaign bounce rate checked with the same thresholds as Instantly
+        (auto-pause at cfg.campaign_bounce_pause_threshold).
+
+    Alert-only (no auto-reconnect for Smartlead in v1 — fix in the Smartlead
+    dashboard): disconnected accounts and low warmup health surface in the
+    daily report.
+    """
+    client = SmartleadClient(api_key)
+    summary = WorkspaceSummary(f"{ws_name} [Smartlead]", tool="smartlead")
+
+    try:
+        accounts = client.get_email_accounts()
+    except Exception as exc:
+        logger.error("Smartlead workspace %s: failed to get accounts: %s", ws_name, exc)
+        report.workspace_errors.append({"workspace_name": f"{ws_name} [Smartlead]", "error": str(exc)})
+        return
+
+    for account in accounts:
+        email = str(account.get("from_email") or account.get("email") or "").strip().lower()
+        account_id = account.get("id")
+        if not email or account_id is None:
+            continue
+
+        # ── Daily send limit cap ─────────────────────────────────────────────
+        raw_limit = account.get("message_per_day", account.get("max_email_per_day"))
+        if raw_limit is not None:
+            try:
+                current_limit = int(raw_limit)
+            except (TypeError, ValueError):
+                current_limit = None
+            if current_limit is not None and current_limit > cfg.daily_limit_max:
+                ok = client.update_daily_limit(account_id, cfg.daily_limit_max)
+                report.daily_limit_adjustments.append({
+                    "email": email,
+                    "workspace_name": f"{ws_name} [Smartlead]",
+                    "previous_limit": current_limit,
+                    "new_limit": cfg.daily_limit_max,
+                    "success": ok,
+                })
+
+        # ── Connection status ────────────────────────────────────────────────
+        if SmartleadClient.is_connected(account):
+            summary.connected += 1
+            if email in alert_state:
+                logger.info("Smartlead account %s (%s) recovered — clearing alert state.", email, ws_name)
+                try:
+                    sheets.delete_alert_state(email)
+                    del alert_state[email]
+                except Exception as exc:
+                    logger.error("Failed to clear alert_state for Smartlead %s: %s", email, exc)
+        else:
+            summary.disconnected += 1
+            if is_new_disconnection(email, alert_state):
+                existing_row = alert_state.get(email, {})
+                new_row = {
+                    "email": email.lower(),
+                    "workspace_name": ws_name,
+                    "first_detected": existing_row.get("first_detected") or utcnow_str(),
+                    "last_alerted": utcnow_str(),
+                    "reconnect_attempts": 0,
+                    "status": "smartlead_disconnected",
+                }
+                try:
+                    sheets.upsert_alert_state(**new_row)
+                    alert_state[email] = new_row
+                except Exception as exc:
+                    logger.error("Failed to write alert_state for Smartlead %s: %s", email, exc)
+            report.still_disconnected.append({
+                "email": email,
+                "workspace_name": ws_name,
+                "provider": "smartlead",
+                "attempts": 0,
+            })
+
+        # ── Warmup health (from account payload — no extra API call) ──────────
+        wh = SmartleadClient.warmup_health(account)
+        if wh:
+            score = wh["health_score"]
+            if score is not None and score < cfg.health_score_alert_threshold:
+                report.health_alerts.append({
+                    "email": email,
+                    "workspace_name": f"{ws_name} [Smartlead]",
+                    "health_score": int(score),
+                    "age_days": None,
+                    "is_new_account": False,
+                    "action_taken": "Monitor closely — reduce send volume if it drops further",
+                })
+            if wh["spam_rate"] >= cfg.spam_rate_alert_threshold and wh["sent"] > 0:
+                report.health_alerts.append({
+                    "email": email,
+                    "workspace_name": f"{ws_name} [Smartlead]",
+                    "health_score": int(score) if score is not None else 0,
+                    "age_days": None,
+                    "is_new_account": False,
+                    "action_taken": f"Warmup spam rate {wh['spam_rate']:.1f}% "
+                                    f"({wh['spam']}/{wh['sent']}) — pause and investigate",
+                })
+
+        # ── Signature check ──────────────────────────────────────────────────
+        if not str(account.get("signature") or "").strip():
+            report.signature_issues.append({"email": email, "workspace_name": ws_name})
+
+    report.signature_checked_by_ws[f"{ws_name} [Smartlead]"] = len(accounts)
+
+    # ── Campaign bounce check ────────────────────────────────────────────────
+    try:
+        campaigns = client.get_campaigns()
+        active = [c for c in campaigns if str(c.get("status", "")).upper() == "ACTIVE"]
+        _process_smartlead_campaign_health(active, ws_name, client, report, cfg)
+    except Exception as exc:
+        logger.warning("Smartlead campaign analytics failed for %s: %s (non-fatal)", ws_name, exc)
+
+    report.workspace_summaries.append(summary)
+    logger.info(
+        "Smartlead workspace %s: %d connected, %d disconnected.",
+        ws_name, summary.connected, summary.disconnected,
+    )
+
+
+def _process_smartlead_campaign_health(
+    campaigns: List[Dict],
+    ws_name: str,
+    client: "SmartleadClient",
+    report: ReportData,
+    cfg: "Config",
+) -> None:
+    """
+    Check Smartlead campaign bounce rates using the same thresholds as Instantly.
+    Reads GET /campaigns/{id}/analytics defensively (field names vary).
+    """
+    for campaign in campaigns:
+        campaign_id = campaign.get("id")
+        name = campaign.get("name", "Unknown")
+        if campaign_id is None:
+            continue
+
+        stats = client.get_campaign_analytics(campaign_id)
+        if not stats:
+            continue
+
+        sent = int(
+            stats.get("sent_count")
+            or stats.get("email_sent_count")
+            or stats.get("total_sent")
+            or 0
+        )
+        bounced = int(
+            stats.get("bounce_count")
+            or stats.get("bounced_count")
+            or stats.get("total_bounced")
+            or 0
+        )
+        replied = int(
+            stats.get("reply_count")
+            or stats.get("replied_count")
+            or stats.get("total_replies")
+            or 0
+        )
+
+        if sent < cfg.campaign_min_sent_for_bounce_check:
+            continue
+
+        bounce_rate = (bounced / sent * 100) if sent > 0 else 0.0
+        if bounce_rate < cfg.bounce_rate_alert_threshold:
+            continue
+
+        reply_rate = (replied / sent * 100) if sent > 0 else 0.0
+        action_taken = ""
+        if bounce_rate >= cfg.campaign_bounce_pause_threshold:
+            paused = client.pause_campaign(campaign_id)
+            if paused:
+                action_taken = "Auto-paused campaign — re-verify lead list before resuming"
+                logger.warning(
+                    "Auto-paused Smartlead campaign '%s' (%s) — bounce rate %.1f%% exceeds %d%%.",
+                    name, ws_name, bounce_rate, cfg.campaign_bounce_pause_threshold,
+                )
+            else:
+                action_taken = "Auto-pause failed — pause manually in Smartlead and re-verify lead list"
+        else:
+            action_taken = "Review lead list quality — consider re-verifying emails before sending more"
+
+        logger.warning(
+            "High bounce rate for Smartlead campaign '%s' (%s): %.1f%% (%d/%d) — %s",
+            name, ws_name, bounce_rate, bounced, sent, action_taken,
+        )
+        report.bounce_alerts.append({
+            "campaign_name": f"{name} (Smartlead)",
+            "workspace_name": ws_name,
+            "bounce_rate": bounce_rate,
+            "bounced": bounced,
+            "sent": sent,
+            "contacted": int(stats.get("contacted_count") or stats.get("total_contacted") or 0),
+            "total_leads": int(stats.get("lead_count") or stats.get("total_leads") or 0),
+            "reply_rate": reply_rate,
+            "replies": replied,
+            "opens": int(stats.get("open_count") or stats.get("unique_open_count") or 0),
+            "open_rate": 0.0,
+            "clicks": int(stats.get("click_count") or stats.get("unique_click_count") or 0),
+            "unsubscribed": int(stats.get("unsubscribed_count") or 0),
+            "action_taken": action_taken,
+        })
+
+
 def _handle_non_reconnectable_error(
     email: str,
     ws_name: str,
@@ -1412,6 +1734,88 @@ def _handle_zapmail_disconnect(
     report.still_disconnected.append({
         "email": email, "workspace_name": ws_name,
         "provider": "zapmail", "attempts": current_attempts,
+    })
+
+
+def _handle_infra_provider_disconnect(
+    provider: str,
+    provider_label: str,
+    provider_client,
+    email: str,
+    ws_name: str,
+    billing_issue: Optional[str],
+    sheets: SheetsClient,
+    alert_state: Dict,
+    report: ReportData,
+    cfg: Config,
+) -> None:
+    """
+    Disconnect handling for the inbox-infrastructure providers whose auto-reconnect
+    is not implemented yet (Premium Inboxes, ScaledMail).
+
+    PHASE 1 behaviour — modelled on the "no client / max attempts" tail of
+    _handle_zapmail_disconnect:
+      - If a billing/subscription issue is detected, skip everything else and
+        report a payment problem.
+      - Otherwise alert once (re-alert honours cfg.zapmail_realert_hours) and
+        write alert_state so subsequent runs stay quiet until recovery.
+      - Recovery is cleared by the connected-account branch at the top of run().
+
+    PHASE 2 (after API credentials): call provider_client.reconnect_email(email)
+    here with the pending / verify-next-run flow ZapMail uses.
+    """
+    existing_row = alert_state.get(email)
+    status_key = f"{provider}_disconnected"
+
+    if billing_issue:
+        logger.warning(
+            "%s billing issue for %s (%s): %s — skipping reconnect.",
+            provider_label, email, ws_name, billing_issue,
+        )
+        new_row = build_new_alert_state_row(email, ws_name)
+        if existing_row:
+            new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
+        new_row["status"] = f"{provider}_billing_issue"
+        new_row["reconnect_attempts"] = cfg.max_reconnect_attempts
+        try:
+            sheets.upsert_alert_state(**new_row)
+            alert_state[email] = new_row
+        except Exception as exc:
+            logger.error("Failed to write alert_state for %s billing %s: %s", provider, email, exc)
+        report.still_disconnected.append({
+            "email": email, "workspace_name": ws_name,
+            "provider": provider, "attempts": 0,
+            "reason": f"{provider_label} payment pending — {billing_issue}",
+        })
+        return
+
+    # Phase 2 hook — currently a no-op stub that returns (False, False).
+    if provider_client is not None:
+        try:
+            provider_client.reconnect_email(email)
+        except Exception as exc:
+            logger.warning("%s reconnect_email raised for %s: %s (ignored)", provider_label, email, exc)
+
+    is_new      = is_new_disconnection(email, alert_state)
+    should_real = should_realert(email, alert_state, cfg.zapmail_realert_hours)
+    if is_new or should_real:
+        logger.info("Sending %s disconnect alert for %s (%s).", provider_label, email, ws_name)
+        new_row = build_new_alert_state_row(email, ws_name)
+        if existing_row:
+            new_row["first_detected"] = existing_row.get("first_detected", new_row["first_detected"])
+        new_row["status"] = status_key
+        try:
+            sheets.upsert_alert_state(**new_row)
+            alert_state[email] = new_row
+        except Exception as exc:
+            logger.error("Failed to write alert_state for %s %s: %s", provider, email, exc)
+    else:
+        logger.debug("%s %s (%s) still disconnected — already alerted, silent.", provider_label, email, ws_name)
+
+    report.still_disconnected.append({
+        "email": email, "workspace_name": ws_name,
+        "provider": provider, "attempts": 0,
+        "reason": f"{provider_label} account — reconnect in the {provider_label} dashboard",
     })
 
 
